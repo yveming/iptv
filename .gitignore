@@ -3,3 +3,4 @@
 *.xml
 *.gz
 *.log
+__pycache__
