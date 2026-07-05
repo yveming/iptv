@@ -259,29 +259,6 @@ class IPTVSetTopBox:
     # public API
     # ------------------------------------------------------------------
 
-    @classmethod
-    def find_key(this, Authenticator):
-        """暴力破解 DES 密钥（从 'Authenticator' 反向尝试）。"""
-        result = []
-        try:
-            cipher = bytes.fromhex(Authenticator)
-        except Exception as e:
-            this.logger.error('[find_key] Authenticator 解析失败: %s', e)
-            return result
-
-        for n in range(100000000):
-            key_candidate = f"{n:0>8d}"
-            des = DES.new(key_candidate.encode(), DES.MODE_ECB)
-            decrypt = des.decrypt(cipher)
-            try:
-                decrypt_text = decrypt.decode()
-                this.key = key_candidate
-                result = [key_candidate, decrypt_text]
-                break
-            except Exception:
-                continue
-        return result
-
     def get_channel_list(self):
         """Authenticate (if needed) and return the full channel list.
 
@@ -422,6 +399,9 @@ def _proxy_base_url(proxy, source_url):
 
 
 def _m3u_channel_url(ch, options):
+    if ch.get('url'):
+        return _merge_channel_url(ch['url'], options)
+
     source_url = f'rtp://{ch["igmp_addr"]}'
     proxy = options.get('proxy', '')
     if not proxy:
@@ -437,6 +417,13 @@ def _m3u_channel_url(ch, options):
             if fcc_type != 'telecom':
                 url = _append_query(url, f'fcc-type={fcc_type}')
     return url
+
+
+def _merge_channel_url(source_url, options):
+    proxy = options.get('proxy', '')
+    if not proxy or urlparse(source_url).scheme.lower() != 'rtp':
+        return source_url
+    return _proxy_base_url(proxy, source_url)
 
 
 def _catchup_attr(ch, options):
@@ -455,13 +442,18 @@ def _write_m3u_channels(filepath, channels, options=None):
     with open(filepath, 'w', encoding='utf-8') as fp:
         print(_m3u_header(), file=fp)
         for ch in channels:
-            group_title = classify(ch['name'])
-            catchup = _catchup_attr(ch, options)
+            group_title = ch.get('group_title') or classify(ch['name'])
+            catchup = _catchup_attr(ch, options) if 'timeshift' in ch else ''
+            display_name = ch.get('display_name') or ch['name']
+            tvg_id = ch.get('tvg_id') or ch['name']
+            tvg_name = ch.get('tvg_name') or ch['name']
+            for prop in ch.get('props', []):
+                fp.write(f'{prop}\n')
             if catchup:
                 fp.write('#KODIPROP:inputstream=inputstream.ffmpegdirect\n')
             fp.write(
-                f'#EXTINF:-1 tvg-id="{ch["name"]}" tvg-name="{ch["name"]}"'
-                f' group-title="{group_title}"{catchup}, {ch["name"]}\n'
+                f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{tvg_name}"'
+                f' group-title="{group_title}"{catchup}, {display_name}\n'
             )
             fp.write(f'{_m3u_channel_url(ch, options)}\n')
 
@@ -480,16 +472,49 @@ def _prepare_channels(channels):
             continue
         item = ch.copy()
         item['name'] = clean_pattern.sub('', item['name'])
+        if item['name'] == 'CCTV-少儿':
+            item['name'] = 'CCTV-14'
         clean_channels.append(item)
     return clean_channels
 
 
-def _selected_match(name, selected_channels):
-    for selected_name in selected_channels:
-        selected_name = str(selected_name).strip()
-        if selected_name and (selected_name in name or name in selected_name):
-            return selected_name
-    return ''
+def _channel_key(ch):
+    return ch.get('name') or ch.get('url') or ''
+
+
+def _dedupe_channels(channels):
+    result = []
+    used_keys = set()
+    for ch in channels:
+        key = _channel_key(ch)
+        if not key:
+            continue
+        if key in used_keys:
+            continue
+        result.append(ch)
+        used_keys.add(key)
+    return result
+
+
+def _dedupe_epg_root(root):
+    channel_ids = set()
+    programme_keys = set()
+    for elem in list(root):
+        if elem.tag == 'channel':
+            channel_id = elem.get('id', '')
+            if channel_id in channel_ids:
+                root.remove(elem)
+                continue
+            channel_ids.add(channel_id)
+        elif elem.tag == 'programme':
+            title_elem = elem.find('title')
+            title = title_elem.text if title_elem is not None else ''
+            key = (elem.get('channel', ''), elem.get('start', ''), elem.get('stop', ''), title)
+            if key in programme_keys:
+                root.remove(elem)
+                continue
+            programme_keys.add(key)
+    return channel_ids, programme_keys
 
 
 def _select_channels(channels, selected_channels):
@@ -516,22 +541,24 @@ def _select_channels(channels, selected_channels):
         if match_index is None:
             continue
         item = channels[match_index].copy()
-        item['name'] = selected_name
+        item['display_name'] = selected_name
         result.append(item)
         used_indexes.add(match_index)
     return result
 
 
-def generate_m3u(channels, filepath='iptv-full.m3u', options=None, selected_channels=None):
+def generate_m3u(channels, filepath='iptv-full.m3u', options=None, selected_channels=None, merge_channels=None):
     """Generate an M3U playlist and return channels written to it."""
     logger = logging.getLogger(__name__)
     options = options or {}
-    output_channels = channels
+    output_channels = _dedupe_channels(list(channels) + list(merge_channels or []))
     if options.get('selected'):
-        output_channels = _select_channels(channels, selected_channels or [])
+        output_channels = _select_channels(output_channels, selected_channels or [])
         if not output_channels:
             logger.warning('[generate_m3u] 未匹配到精选频道，跳过写入: %s', filepath)
             return []
+    else:
+        output_channels = _dedupe_channels(output_channels)
 
     try:
         _write_m3u_channels(filepath, output_channels, options)
@@ -539,59 +566,6 @@ def generate_m3u(channels, filepath='iptv-full.m3u', options=None, selected_chan
     except OSError as e:
         logger.error('[generate_m3u] 文件写入失败 (%s): %s', filepath, e)
     return output_channels
-
-
-def generate_selected_m3u(source_path, selected_config):
-    """兼容旧配置：从完整 M3U 文件中按频道名关键词过滤出精选频道。"""
-    logger = logging.getLogger(__name__)
-    if not selected_config:
-        return
-
-    filepath = selected_config.get('path', '')
-    names = selected_config.get('channels', [])
-    if not filepath or not names:
-        return
-    if isinstance(names, str):
-        names = [names]
-
-    try:
-        with open(source_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-    except OSError as e:
-        logger.error('[generate_selected_m3u] 读取源文件失败 (%s): %s', source_path, e)
-        return
-
-    selected_lines = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if line.startswith('#EXTINF:'):
-            last_comma = line.rfind(',')
-            if last_comma != -1:
-                display_name = line[last_comma + 1:].strip()
-                selected_name = _selected_match(display_name, names)
-                if selected_name:
-                    if i > 0 and lines[i - 1].startswith('#KODIPROP:'):
-                        selected_lines.append(lines[i - 1])
-                    selected_lines.append(line[:last_comma + 1] + f' {selected_name}\n')
-                    i += 1
-                    while i < len(lines) and not lines[i].startswith('#') and lines[i].strip():
-                        selected_lines.append(lines[i])
-                        i += 1
-                    continue
-        i += 1
-
-    if not selected_lines:
-        logger.warning('[generate_selected_m3u] 未匹配到精选频道，跳过写入: %s', filepath)
-        return
-
-    try:
-        with open(filepath, 'w', encoding='utf-8') as fp:
-            fp.write(_m3u_header() + '\n')
-            fp.writelines(selected_lines)
-        logger.info('精选 M3U 文件已生成: %s (%s 条)', filepath, len(selected_lines) // 2)
-    except OSError as e:
-        logger.error('[generate_selected_m3u] 文件写入失败 (%s): %s', filepath, e)
 
 
 def _write_epg_gzip(filepath):
@@ -675,13 +649,6 @@ def resolve_output_path(path, base_dir):
     return os.path.join(base_dir, path)
 
 
-def resolve_selected_config(selected_config, base_dir):
-    if not selected_config:
-        return {}
-    result = selected_config.copy()
-    result['path'] = resolve_output_path(result.get('path', ''), base_dir)
-    return result
-
 
 def _is_url(source):
     return urlparse(source).scheme in ('http', 'https')
@@ -710,26 +677,61 @@ def _read_merge_source(source):
     return b''
 
 
-def merge_m3u(filepath, sources):
-    logger = logging.getLogger(__name__)
-    sources = _as_list(sources)
-    if not sources:
-        return
+def _parse_extinf_attrs(extinf):
+    return dict(re.findall(r'([\w-]+)="([^"]*)"', extinf))
 
-    try:
-        with open(filepath, 'ab') as fp:
-            for source in sources:
-                data = _read_merge_source(source)
-                if not data:
-                    continue
-                text = data.decode('utf-8-sig', errors='ignore').strip()
-                lines = [line for line in text.splitlines() if line.strip() and not line.startswith('#EXTM3U')]
-                if not lines:
-                    continue
-                fp.write(b'\n'.join(line.encode('utf-8') for line in lines) + b'\n')
-                logger.info('已合并 M3U: %s -> %s', source, filepath)
-    except OSError as e:
-        logger.error('[merge_m3u] 文件写入失败 (%s): %s', filepath, e)
+
+def _parse_m3u_channels(text):
+    channels = []
+    pending_props = []
+    current_attrs = None
+    current_display = ''
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#EXTM3U'):
+            continue
+        if line.startswith('#EXTINF'):
+            current_attrs = _parse_extinf_attrs(line)
+            current_display = line.split(',', 1)[1].strip() if ',' in line else ''
+            continue
+        if line.startswith('#'):
+            pending_props.append(line)
+            continue
+        if current_attrs is None:
+            pending_props = []
+            continue
+
+        tvg_id = current_attrs.get('tvg-id', '').strip()
+        tvg_name = current_attrs.get('tvg-name', '').strip()
+        display_name = current_display or tvg_name or tvg_id or line
+        name = tvg_name or tvg_id or display_name
+        channels.append({
+            'name': name,
+            'display_name': display_name,
+            'tvg_id': tvg_id or name,
+            'tvg_name': tvg_name or name,
+            'group_title': current_attrs.get('group-title', ''),
+            'url': line,
+            'props': pending_props,
+        })
+        pending_props = []
+        current_attrs = None
+        current_display = ''
+    return channels
+
+
+def load_merge_m3u_channels(sources):
+    logger = logging.getLogger(__name__)
+    channels = []
+    for source in _as_list(sources):
+        data = _read_merge_source(source)
+        if not data:
+            continue
+        text = data.decode('utf-8-sig', errors='ignore')
+        source_channels = _parse_m3u_channels(text)
+        channels.extend(source_channels)
+        logger.info('已读取合并 M3U: %s (%s 个频道)', source, len(source_channels))
+    return channels
 
 
 def merge_epg(filepath, sources):
@@ -741,6 +743,7 @@ def merge_epg(filepath, sources):
     try:
         tree = etree.parse(filepath)
         root = tree.getroot()
+        channel_ids, programme_keys = _dedupe_epg_root(root)
         for source in sources:
             data = _read_merge_source(source)
             if not data:
@@ -756,9 +759,23 @@ def merge_epg(filepath, sources):
             except etree.ParseError as e:
                 logger.error('[merge_epg] XML 解析失败 (%s): %s', source, e)
                 continue
+            merged_count = 0
             for elem in list(merge_root):
+                if elem.tag == 'channel':
+                    channel_id = elem.get('id', '')
+                    if channel_id in channel_ids:
+                        continue
+                    channel_ids.add(channel_id)
+                elif elem.tag == 'programme':
+                    title_elem = elem.find('title')
+                    title = title_elem.text if title_elem is not None else ''
+                    key = (elem.get('channel', ''), elem.get('start', ''), elem.get('stop', ''), title)
+                    if key in programme_keys:
+                        continue
+                    programme_keys.add(key)
                 root.append(elem)
-            logger.info('已合并 EPG: %s -> %s', source, filepath)
+                merged_count += 1
+            logger.info('已合并 EPG: %s -> %s (%s 个节点)', source, filepath, merged_count)
         _write_epg_tree(filepath, root)
         logger.info('EPG 合并文件已生成: %s.gz', filepath)
     except OSError as e:
@@ -830,7 +847,7 @@ if __name__ == '__main__':
         logger.info('日志文件: %s', log_path)
 
         merge_config = config.get('merge', {})
-        selected_config = resolve_selected_config(config.get('selected', {}), config_dir)
+        selected_config = config.get('selected', {})
         selected_channels = _as_list(selected_config.get('channels'))
 
         stb = IPTVSetTopBox(
@@ -844,13 +861,10 @@ if __name__ == '__main__':
 
         channels = _prepare_channels(stb.get_channel_list())
         m3u_targets = parse_m3u_targets(config, config_dir)
+        merge_m3u_channels = load_merge_m3u_channels(merge_config.get('m3u'))
         for target in m3u_targets:
-            generate_m3u(channels, target['path'], target['options'], selected_channels)
-            if target['options'].get('merge'):
-                merge_m3u(target['path'], merge_config.get('m3u'))
-
-        if not isinstance(config.get('m3u'), list) and selected_config.get('path'):
-            generate_selected_m3u(m3u_targets[0]['path'], selected_config)
+            target_merge_channels = merge_m3u_channels if target['options'].get('merge') else []
+            generate_m3u(channels, target['path'], target['options'], selected_channels, target_merge_channels)
 
         for epg_path in parse_epg_paths(config, config_dir):
             generate_epg(stb, channels, epg_path)
