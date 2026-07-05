@@ -662,6 +662,19 @@ def _as_list(value):
     return [value]
 
 
+def resolve_merge_sources(sources, base_dir):
+    resolved_sources = []
+    for source in _as_list(sources):
+        source = str(source).strip()
+        if not source:
+            continue
+        if _is_url(source) or os.path.isabs(source):
+            resolved_sources.append(source)
+        else:
+            resolved_sources.append(os.path.join(base_dir, source))
+    return resolved_sources
+
+
 def _read_merge_source(source):
     logger = logging.getLogger(__name__)
     try:
@@ -847,6 +860,8 @@ if __name__ == '__main__':
         logger.info('日志文件: %s', log_path)
 
         merge_config = config.get('merge', {})
+        merge_m3u_sources = resolve_merge_sources(merge_config.get('m3u'), config_dir)
+        merge_epg_sources = resolve_merge_sources(merge_config.get('epg'), config_dir)
         selected_config = config.get('selected', {})
         selected_channels = _as_list(selected_config.get('channels'))
 
@@ -861,14 +876,14 @@ if __name__ == '__main__':
 
         channels = _prepare_channels(stb.get_channel_list())
         m3u_targets = parse_m3u_targets(config, config_dir)
-        merge_m3u_channels = load_merge_m3u_channels(merge_config.get('m3u'))
+        merge_m3u_channels = load_merge_m3u_channels(merge_m3u_sources)
         for target in m3u_targets:
             target_merge_channels = merge_m3u_channels if target['options'].get('merge') else []
             generate_m3u(channels, target['path'], target['options'], selected_channels, target_merge_channels)
 
         for epg_path in parse_epg_paths(config, config_dir):
             generate_epg(stb, channels, epg_path)
-            merge_epg(epg_path, merge_config.get('epg'))
+            merge_epg(epg_path, merge_epg_sources)
     except IPTVError as e:
         logger.error('IPTV 错误 [%s]: %s', e.label, e)
         sys.exit(1)
