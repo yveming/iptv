@@ -33,12 +33,6 @@ from Crypto.Util.Padding import pad
 
 
 REQUIRED_CONFIG_KEYS = ['userid', 'key', 'stbid', 'mac', 'login_entry', 'egp_uri']
-AUTH_DATA_KEYS = [
-    'UserID', 'Lang', 'SupportHD', 'NetUserID', 'Authenticator', 'STBType', 'STBVersion',
-    'conntype', 'STBID', 'templateName', 'areaId', 'userToken', 'userGroupId',
-    'productPackageId', 'mac', 'UserField', 'SoftwareVersion', 'IsSmartStb', 'desktopId',
-    'stbmaker', 'XMPPCapability', 'ChipID', 'VIP',
-]
 DEFAULT_CATCHUP_FORMAT = 'playseek={{utc:YmdHMS}}-{{utcend:YmdHMS}}'
 VALID_FCC_TYPES = ('huawei', 'telecom')
 
@@ -173,7 +167,7 @@ class IPTVSetTopBox:
         if not token:
             self.logger.error('[_auth] EncryptToken 提取失败, 认证可能不完整')
         authenticator = self._build_authenticator(token)
-        data = self._build_auth_data()
+        data = self._build_auth_data(auth_form)
         data['Authenticator'] = authenticator
         data['userToken'] = token
         self.headers['Referer'] = resp.url
@@ -230,8 +224,12 @@ class IPTVSetTopBox:
         self.logger.error('[_extract_token] 未匹配到 EncryptToken')
         return ''
 
-    def _build_auth_data(self):
-        data = {key: '' for key in AUTH_DATA_KEYS}
+    def _build_auth_data(self, auth_form):
+        data = {
+            inp.get('name'): inp.get('value', '')
+            for inp in auth_form.find_all('input')
+            if inp.get('name')
+        }
         data['UserID'] = self.user_id
         data['STBID'] = self.stb_id
         data['mac'] = self.mac
