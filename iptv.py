@@ -463,7 +463,7 @@ def _prepare_channels(channels):
             '红原', '乐山', '熊猫', '大爱', 'i成都',
         ])
     )
-    clean_pattern = re.compile(r'(?:专区|高清|超清)+$')
+    clean_pattern = re.compile(r'(?:专区|高清|超清|频道)+$')
     clean_channels = []
     for ch in channels:
         if exclude_pattern.search(ch['name']):
