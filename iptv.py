@@ -33,7 +33,7 @@ from Crypto.Util.Padding import pad
 
 
 REQUIRED_CONFIG_KEYS = ['userid', 'key', 'stbid', 'mac', 'login_entry', 'egp_uri']
-DEFAULT_CATCHUP_FORMAT = 'playseek={{utc:YmdHMS}}-{{utcend:YmdHMS}}'
+DEFAULT_CATCHUP_FORMAT = 'playseek={utc:YmdHMS}-{utcend:YmdHMS}'
 VALID_FCC_TYPES = ('huawei', 'telecom')
 
 
