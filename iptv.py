@@ -370,11 +370,14 @@ def classify(name):
     return '数字频道'
 
 
-def _m3u_header():
-    return (
+def _m3u_header(x_tvg_url=""):
+    line = (
         f'#EXTM3U name="成都电信IPTV '
         f'{os.path.basename(__file__)} @ {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}"'
     )
+    if x_tvg_url:
+        line += f" x-tvg-url=\"{x_tvg_url}\""
+    return line
 
 
 def _append_query(url, query):
@@ -438,7 +441,7 @@ def _catchup_attr(ch, options):
 def _write_m3u_channels(filepath, channels, options=None):
     options = options or {}
     with open(filepath, 'w', encoding='utf-8') as fp:
-        print(_m3u_header(), file=fp)
+        print(_m3u_header(options.get("x-tvg-url", "")), file=fp)
         for ch in channels:
             group_title = ch.get('group_title') or classify(ch['name'])
             catchup = _catchup_attr(ch, options) if 'timeshift' in ch else ''
@@ -795,7 +798,7 @@ def merge_epg(filepath, sources):
         logger.error('[merge_epg] 目标 XML 解析失败 (%s): %s', filepath, e)
 
 
-def parse_m3u_targets(config, base_dir):
+def parse_m3u_targets(config, base_dir, global_x_tvg_url=""):
     logger = logging.getLogger(__name__)
     selected_channels = _as_list(config.get('selected', {}).get('channels'))
     has_merge = bool(_as_list(config.get('merge', {}).get('m3u')))
@@ -822,6 +825,8 @@ def parse_m3u_targets(config, base_dir):
             options['selected'] = bool(selected_channels) and not legacy_scalar
         if 'merge' not in options:
             options['merge'] = has_merge
+        if 'x-tvg-url' not in options and global_x_tvg_url:
+            options['x-tvg-url'] = global_x_tvg_url
         targets.append({'path': resolve_output_path(path, base_dir), 'options': options})
     return targets
 
@@ -873,7 +878,7 @@ if __name__ == '__main__':
         )
 
         channels = _prepare_channels(stb.get_channel_list())
-        m3u_targets = parse_m3u_targets(config, config_dir)
+        m3u_targets = parse_m3u_targets(config, config_dir, config.get("x-tvg-url", ""))
         merge_m3u_channels = load_merge_m3u_channels(merge_m3u_sources)
         for target in m3u_targets:
             target_merge_channels = merge_m3u_channels if target['options'].get('merge') else []
