@@ -60,6 +60,8 @@ python iptv.py
   "login_entry": "http://182.138.3.142:8082/EDS/jsp/AuthenticationURL",
   "egp_uri": "/EPG/jsp/liveplay_30/en/getTvodData.jsp",
 
+  "x-tvg-url": "http://192.168.1.100/epg/iptv-epg.xml",
+
   "log": "iptv.log",
 
   "m3u": [
@@ -116,6 +118,7 @@ python iptv.py
 ### 输出路径
 
 - `m3u`：M3U 输出配置，可以是字符串或数组
+- `x-tvg-url`：全局 EPG 地址，每个 M3U 输出可在对应选项中覆盖
 - `epg`：XMLTV EPG 输出配置，可以是字符串或数组
 - `log`：日志文件输出路径
 
@@ -161,6 +164,7 @@ python iptv.py
 - `proxy`：代理地址
 - `fcc`：FCC 协议类型，可为 `"telecom"` 或 `"huawei"`
 - `fcc-type`：FCC 协议类型；也支持 `"fcc": true, "fcc-type": "telecom"` 的写法
+- `x-tvg-url`：EPG 地址，写入 `#EXTM3U x-tvg-url="..."`；未配置时回退使用顶层同名字段
 
 默认规则：
 
