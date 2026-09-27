@@ -291,6 +291,13 @@ class IPTVSetTopBox:
                 })
         except Exception as e:
             self.logger.error('[get_channel_list] 频道解析失败: %s', e)
+        if not self._channel_list:
+            self.logger.error(
+                '[get_channel_list] 未获取到频道列表，保留已有输出 (url=%s, status=%s, len=%s, content-type=%s)',
+                resp.url, resp.status_code, len(resp.text),
+                resp.headers.get('Content-Type', ''))
+            self.logger.error('[get_channel_list] 原始响应前 1000 字符: %r', resp.text[:1000])
+            raise IPTVError('未获取到频道列表', label='get_channel_list')
         self.logger.info('频道列表获取完成: %s 个频道', len(self._channel_list))
         return self._channel_list
 
