@@ -22,19 +22,42 @@ import time
 import socket
 import sys
 import os
+import hashlib
+import random
 import argparse
 import logging
+from datetime import datetime, timezone, timedelta
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit, parse_qs
 from xml.etree import ElementTree as etree
 from Crypto.Cipher import DES
 from Crypto.Util.Padding import pad
 
 
-REQUIRED_CONFIG_KEYS = ['userid', 'key', 'stbid', 'mac', 'login_entry', 'egp_uri']
+REQUIRED_CONFIG_KEYS = ['userid', 'key', 'stbid', 'mac', 'login_entry', 'egp_uri']  # 电信模式必填
 DEFAULT_CATCHUP_FORMAT = 'playseek={utc:YmdHMS}-{utcend:YmdHMS}'
+DEFAULT_CMCC_CATCHUP_FORMAT = '{utc:YmdHMS}/{utcend:YmdHMS}/1.m3u8'
 VALID_FCC_TYPES = ('huawei', 'telecom')
+VALID_ISP_TYPES = ('telecom', 'cmcc')
+
+# ---------------------------------------------------------------------------
+# 移动 ysten/taipan EPG 服务（chlist/pglist 为免认证缓存接口）
+# ---------------------------------------------------------------------------
+
+DEFAULT_CMCC_EPG_BASE = 'http://192.0.2.3:7070/ysten-wtv-epg/epg/wtv'
+DEFAULT_CMCC_LOOKBACK_BASE = (
+    'http://lookback.example.com:8089/yst.lookback.scmobile.com'
+    '/192.0.2.4:8080/ysten-business/lookback'
+)
+DEFAULT_CMCC_EPG_DAYS = 8
+DEFAULT_CMCC_ABILITY_STRING = {
+    'CITY_CODE': '01', 'COUNTY_CODE': '22480', 'VILLAGE_CODE': '',
+    'abilities': ['DL-3rd', 'fcc', 'NxM', 'fec', 'cp-TENCENT|timeShift', 'ver-tp'],
+    'businessGroupIds': [], 'deviceGroupIds': ['4133'], 'districtCode': '510000',
+    'labelIds': ['101', '1024'], 'ucsUserAbilityRefresh': '1600000000000',
+    'userGroupIds': ['1000'], 'userLabelIds': ['101', '1024'],
+}
 
 
 class IPTVError(Exception):
@@ -342,12 +365,202 @@ class IPTVSetTopBox:
                     if not start or not stop:
                         continue
                     title = prog.get('programName', '未知节目')
-                    title = title.replace('<', '《').replace('>', '》').replace('&', '&amp;')
+                    # < > 转全角避免下游解析问题；& 由 ElementTree 序列化时自行转义，勿手工替换（会二次转义）
+                    title = title.replace('<', '《').replace('>', '》')
                     programs.append({
                         'start': start, 'stop': stop,
                         'title': title, 'channel_id': channel_id,
                     })
         except Exception as e:
+            self.logger.error('[get_channel_programs] EPG数据遍历异常 (ch=%s): %s', channel_id, e)
+        return programs
+
+
+class CMCCSetTopBox:
+    """移动 ysten/taipan EPG 数据源（免认证）。
+
+    chlist/pglist 为前置 Nginx 缓存接口，不校验会话，认证链（iptvepg / ysten）
+    与频道、节目单获取无关，因此无需模拟机顶盒认证。
+    返回的频道结构与 IPTVSetTopBox 保持一致，供 M3U/EPG 输出管线直接复用。
+    """
+
+    def __init__(self, settings=None):
+        settings = settings or {}
+        self.epg_base = str(settings.get('epg_base') or DEFAULT_CMCC_EPG_BASE).rstrip('/')
+        self.lookback_base = str(settings.get('lookback_base') or DEFAULT_CMCC_LOOKBACK_BASE).rstrip('/')
+        try:
+            self.epg_days = int(settings.get('epg_days') or DEFAULT_CMCC_EPG_DAYS)
+        except (TypeError, ValueError):
+            self.epg_days = DEFAULT_CMCC_EPG_DAYS
+        self.ability_string = self._build_ability_string(settings.get('ability_string'))
+        self.yauth = str(settings.get('yauth') or self._build_yauth(settings))
+        self.session = requests.Session()
+        self.headers = {
+            'User-Agent': 'gefo8(ysten) vfa5',
+            'YAUTH': self.yauth,
+            'Referer': 'http://epg.example.com/deep/watchtv_sc/index.html',
+        }
+        self._channel_list = []
+        self.logger = logging.getLogger(f'{__name__}.{self.__class__.__name__}')
+        self.logger.info('CMCC STB 初始化: epg_base=%s epg_days=%s', self.epg_base, self.epg_days)
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_ability_string(ability):
+        if isinstance(ability, dict):
+            return json.dumps(ability, ensure_ascii=False, separators=(',', ':'))
+        if isinstance(ability, str) and ability.strip():
+            return ability.strip()
+        return json.dumps(DEFAULT_CMCC_ABILITY_STRING, ensure_ascii=False, separators=(',', ':'))
+
+    @staticmethod
+    def _build_yauth(settings):
+        """按抓包格式生成 YAUTH 头：md5#hex(unix时间)#deviceId+MAC+版本+Code+STB#V1.0。"""
+        device_id = str(settings.get('device_id') or '012345678901234')
+        mac = str(settings.get('mac') or '00:11:22:33:44:55')
+        version = str(settings.get('version') or 'V8.3.0.4.YP_XX.00.00.00')
+        version_code = str(settings.get('version_code') or '8304')
+        now = int(time.time())
+        digest = hashlib.md5(f'{device_id}{mac}{now}'.encode()).hexdigest()
+        return f'{digest}#{format(now, "x")}#{device_id}{mac}{version}{version_code}STB#V1.0'
+
+    @staticmethod
+    def _random():
+        return f'0.{random.randint(10 ** 8, 10 ** 9 - 1)}'
+
+    def _request_json(self, path, params, log_label):
+        resp = _safe_http('GET', f'{self.epg_base}{path}', session=self.session,
+                          log_label=log_label, params=params, headers=self.headers)
+        try:
+            return resp.json()
+        except ValueError as e:
+            self.logger.error('[%s] JSON解析失败: %s (url=%s)', log_label, e, resp.url)
+            raise IPTVError(f'JSON解析失败 -> {resp.url}', label=log_label) from e
+
+    @staticmethod
+    def _fmt_time(ts):
+        try:
+            ts = int(ts)
+        except (TypeError, ValueError):
+            return ''
+        # 固定按北京时间转换，避免依赖宿主机时区
+        return datetime.fromtimestamp(ts, timezone(timedelta(hours=8))).strftime('%Y%m%d%H%M%S')
+
+    def _epg_date_range(self):
+        """返回 (startDate, endDate)，接口日期格式为 YYYY-M-D，月/日不补零。"""
+        today = datetime.now(timezone(timedelta(hours=8)))
+        start = today - timedelta(days=max(1, self.epg_days) - 2)
+        end = today + timedelta(days=1)
+        return (f'{start.year}-{start.month}-{start.day}',
+                f'{end.year}-{end.month}-{end.day}')
+
+    # ------------------------------------------------------------------
+    # public API（与 IPTVSetTopBox 对齐）
+    # ------------------------------------------------------------------
+
+    def get_channel_list(self):
+        """GET chlist 并映射为与电信模式相同的频道结构。"""
+        if self._channel_list:
+            return self._channel_list
+
+        data = self._request_json('/chlist', {
+            'templateId': '',
+            'abilityString': self.ability_string,
+            'random': self._random(),
+        }, 'CMCC-chlist')
+        if str(data.get('resultCode')) != '000':
+            raise IPTVError(
+                f'chlist 返回错误: {data.get("resultCode")} {data.get("resultMessage")}',
+                label='cmcc_chlist')
+
+        content = data.get('content') or {}
+        for item in (content.get('channels') or []):
+            channel = self._map_channel(item)
+            if channel:
+                self._channel_list.append(channel)
+        if not self._channel_list:
+            self.logger.error('[get_channel_list] chlist 无频道数据 (resultCode=%s)',
+                              data.get('resultCode'))
+            raise IPTVError('未获取到频道列表', label='cmcc_chlist')
+        self.logger.info('频道列表获取完成: %s 个频道', len(self._channel_list))
+        return self._channel_list
+
+    def _map_channel(self, item):
+        resolutions = item.get('resolution') or []
+        resolution = resolutions[0] if resolutions else {}
+        url = item.get('livePlayUrl') or resolution.get('url') or ''
+
+        igmp_addr = ''
+        fcc_ip = fcc_port = fec_port = ''
+        for candidate in (url, item.get('multicastUrl') or ''):
+            if not candidate:
+                continue
+            parts = urlsplit(candidate)
+            if not parts.netloc:
+                continue
+            igmp_addr = parts.netloc.lstrip('@')  # 个别频道为 rtp://@239.x.x.x:5140
+            query = parse_qs(parts.query)
+            fcc_ip = (query.get('ChannelFCCIP') or [''])[0]
+            fcc_port = (query.get('ChannelFCCPort') or [''])[0]
+            fec_port = (query.get('channelFECPort') or [''])[0]
+            break
+
+        channel_id = str(item.get('uuid') or '').strip()
+        if not channel_id or not igmp_addr:
+            self.logger.warning('[_map_channel] 跳过无法解析的频道: %s (uuid=%s url=%s)',
+                                item.get('name'), channel_id, url)
+            return None
+        timeshift = '0' if str(item.get('isShowBack') or '0') == '0' else '1'
+        return {
+            'id': channel_id,
+            'name': str(item.get('name') or channel_id),
+            'user_channel_id': str(item.get('num') or ''),
+            'igmp_addr': igmp_addr,
+            'timeshift': timeshift,
+            'timeshift_len': '7',
+            'timeshift_url': str(resolution.get('timeShiftAlias') or ''),
+            'fcc_enable': '1' if (fcc_ip and fcc_port) else '0',
+            'fcc_ip': fcc_ip,
+            'fcc_port': fcc_port,
+            'fec_port': fec_port,
+            'catchup_prefix': f'{self.lookback_base}/{channel_id}' if timeshift != '0' else '',
+        }
+
+    def get_channel_programs(self, channel_id):
+        """GET pglist，返回 start/stop 为北京时间 yyyyMMddHHmmss 的节目列表。"""
+        start_date, end_date = self._epg_date_range()
+        data = self._request_json('/pglist', {
+            'uuid': channel_id,
+            'startDate': start_date,
+            'endDate': end_date,
+            'templateId': '',
+            'abilityString': self.ability_string,
+            'random': self._random(),
+        }, f'EPG(ch={channel_id})')
+        if str(data.get('resultCode')) != '000':
+            self.logger.warning('[get_channel_programs] pglist 返回错误 (ch=%s): %s %s',
+                                channel_id, data.get('resultCode'), data.get('resultMessage'))
+            return []
+
+        programs = []
+        try:
+            for day in data.get('content') or []:
+                for prog in day.get('programs') or []:
+                    start = self._fmt_time(prog.get('startTime'))
+                    stop = self._fmt_time(prog.get('endTime'))
+                    if not start or not stop:
+                        continue
+                    title = str(prog.get('programName') or '未知节目')
+                    # < > 转全角避免下游解析问题；& 由 ElementTree 序列化时自行转义，勿手工替换（会二次转义）
+                    title = title.replace('<', '《').replace('>', '》')
+                    programs.append({
+                        'start': start, 'stop': stop,
+                        'title': title, 'channel_id': channel_id,
+                    })
+        except AttributeError as e:
             self.logger.error('[get_channel_programs] EPG数据遍历异常 (ch=%s): %s', channel_id, e)
         return programs
 
@@ -377,9 +590,9 @@ def classify(name):
     return '数字频道'
 
 
-def _m3u_header(x_tvg_url=""):
+def _m3u_header(x_tvg_url="", isp_label="电信"):
     line = (
-        f'#EXTM3U name="成都电信IPTV '
+        f'#EXTM3U name="{isp_label}IPTV '
         f'{os.path.basename(__file__)} @ {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}"'
     )
     if x_tvg_url:
@@ -435,20 +648,27 @@ def _merge_channel_url(source_url, options):
 
 
 def _catchup_attr(ch, options):
-    if ch['timeshift'] == '0':
+    if ch.get('timeshift') == '0':
         return ''
-    catchup_format = options.get('catchup-format', DEFAULT_CATCHUP_FORMAT)
-    catchup_format = str(catchup_format).lstrip('?&')
+    catchup_prefix = ch.get('catchup_prefix')
+    if catchup_prefix:
+        # 移动: 路径式回看模板 .../lookback/<uuid>/<开始>/<结束>/1.m3u8
+        catchup_format = str(options.get('catchup-format', DEFAULT_CMCC_CATCHUP_FORMAT)).strip('/')
+        source = f'{catchup_prefix}/{catchup_format}'
+    else:
+        # 电信: 查询串式回看 ...?playseek=<开始>-<结束>
+        catchup_format = str(options.get('catchup-format', DEFAULT_CATCHUP_FORMAT)).lstrip('?&')
+        source = f'{ch["timeshift_url"]}?{catchup_format}'
     return (
         f' catchup="default" catchup-days="7"'
-        f' catchup-source="{ch["timeshift_url"]}?{catchup_format}"'
+        f' catchup-source="{source}"'
     )
 
 
 def _write_m3u_channels(filepath, channels, options=None):
     options = options or {}
     with open(filepath, 'w', encoding='utf-8') as fp:
-        print(_m3u_header(options.get("x-tvg-url", "")), file=fp)
+        print(_m3u_header(options.get("x-tvg-url", ""), options.get("isp-label", "电信")), file=fp)
         for ch in channels:
             group_title = ch.get('group_title') or classify(ch['name'])
             catchup = _catchup_attr(ch, options) if 'timeshift' in ch else ''
@@ -480,6 +700,7 @@ def _prepare_channels(channels):
             continue
         item = ch.copy()
         item['name'] = clean_pattern.sub('', item['name'])
+        item['name'] = re.sub(r'[-_－—\s]+$', '', item['name'])
         if item['name'] == 'CCTV-少儿':
             item['name'] = 'CCTV-14'
         clean_channels.append(item)
@@ -589,7 +810,7 @@ def _write_epg_tree(filepath, tv_root):
     _write_epg_gzip(filepath)
 
 
-def generate_epg(box, channels, filepath='iptv-epg.xml'):
+def generate_epg(box, channels, filepath='iptv-epg.xml', source_info_name='四川电信IPTV'):
     """Generate an XMLTV EPG file from a STB instance and write it to *filepath*.
     传入 channels 可复用 generate_m3u() 的返回结果，省去重复的网络请求和过滤。
     """
@@ -605,7 +826,7 @@ def generate_epg(box, channels, filepath='iptv-epg.xml'):
             'generator-info-name',
             f'{os.path.basename(__file__)} @ {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())}',
         )
-        tv_root.set('source-info-name', '四川成都电信IPTV')
+        tv_root.set('source-info-name', source_info_name)
         for ch in channels:
             programs = box.get_channel_programs(ch['id'])
             if not programs:
@@ -642,10 +863,15 @@ def load_config(filepath):
     except json.JSONDecodeError as e:
         raise IPTVError(f'配置文件 JSON 解析失败: {filepath}') from e
 
-    missing = [key for key in REQUIRED_CONFIG_KEYS if not config.get(key)]
+    isp = str(config.get('isp') or 'telecom').strip().lower()
+    if isp not in VALID_ISP_TYPES:
+        raise IPTVError(f'不支持的 isp: {isp} (可选 {", ".join(VALID_ISP_TYPES)})')
+    config['isp'] = isp
+    required_keys = REQUIRED_CONFIG_KEYS if isp == 'telecom' else []
+    missing = [key for key in required_keys if not config.get(key)]
     if missing:
         raise IPTVError(f'配置文件缺少必填项: {", ".join(missing)}')
-    logger.info('配置文件已加载: %s', filepath)
+    logger.info('配置文件已加载: %s (isp=%s)', filepath, isp)
     return config
 
 
@@ -850,7 +1076,7 @@ def parse_epg_paths(config, base_dir):
 if __name__ == '__main__':
     file_path = os.path.dirname(os.path.abspath(__file__)) or '.'
 
-    parser = argparse.ArgumentParser(description='成都电信 IPTV M3U/EPG 生成器')
+    parser = argparse.ArgumentParser(description='电信/移动 IPTV M3U/EPG 生成器')
     parser.add_argument('-f', '--config', default=os.path.join(file_path, 'iptv.json'), help='配置文件路径')
     args = parser.parse_args()
 
@@ -875,24 +1101,30 @@ if __name__ == '__main__':
         selected_config = config.get('selected', {})
         selected_channels = _as_list(selected_config.get('channels'))
 
-        stb = IPTVSetTopBox(
-            user_id=str(config['userid']),
-            key=str(config['key']),
-            stb_id=str(config['stbid']),
-            mac=str(config['mac']),
-            login_entry=str(config.get('login_entry', '')),
-            egp_uri=str(config.get('egp_uri', '')),
-        )
+        isp = str(config.get('isp') or 'telecom').lower()
+        isp_label = '移动' if isp == 'cmcc' else '电信'
+        if isp == 'cmcc':
+            stb = CMCCSetTopBox(config.get('cmcc') or {})
+        else:
+            stb = IPTVSetTopBox(
+                user_id=str(config['userid']),
+                key=str(config['key']),
+                stb_id=str(config['stbid']),
+                mac=str(config['mac']),
+                login_entry=str(config.get('login_entry', '')),
+                egp_uri=str(config.get('egp_uri', '')),
+            )
 
         channels = _prepare_channels(stb.get_channel_list())
         m3u_targets = parse_m3u_targets(config, config_dir, config.get("x-tvg-url", ""))
         merge_m3u_channels = load_merge_m3u_channels(merge_m3u_sources)
         for target in m3u_targets:
+            target['options'].setdefault('isp-label', isp_label)
             target_merge_channels = merge_m3u_channels if target['options'].get('merge') else []
             generate_m3u(channels, target['path'], target['options'], selected_channels, target_merge_channels)
 
         for epg_path in parse_epg_paths(config, config_dir):
-            generate_epg(stb, channels, epg_path)
+            generate_epg(stb, channels, epg_path, source_info_name=f'四川{isp_label}IPTV')
             merge_epg(epg_path, merge_epg_sources)
     except IPTVError as e:
         logger.error('IPTV 错误 [%s]: %s', e.label, e)

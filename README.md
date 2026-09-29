@@ -1,10 +1,11 @@
 # IPTV Set-Top Box Simulator
 
-电信 IPTV 机顶盒模拟工具，用于完成机顶盒认证、获取频道列表，并生成 M3U 播放列表和 XMLTV EPG 节目单。
+电信 / 移动 IPTV 机顶盒模拟工具，用于完成机顶盒认证（移动模式免认证）、获取频道列表，并生成 M3U 播放列表和 XMLTV EPG 节目单。
 
 ## 功能
 
-- 模拟 IPTV 机顶盒认证流程
+- 模拟 IPTV 机顶盒认证流程（电信）
+- 支持移动 IPTV（ysten EPG，免认证直连频道/节目单接口）
 - 生成 M3U 直播播放列表
 - 支持一次运行输出多个 M3U 文件
 - 支持按频道名关键词生成精选 M3U
@@ -38,9 +39,46 @@ python iptv.py
 
 运行后默认生成配置中指定的 M3U、EPG 和日志文件。
 
+## 移动 IPTV
+
+配置文件设置 `"isp": "cmcc"` 即启用移动模式。频道与节目单来自移动侧 ysten EPG 接口（`chlist` / `pglist`），无需认证，电信模式的必填字段（`userid`、`key`、`stbid`、`login_entry`、`egp_uri`）全部不再需要：
+
+```json
+{
+  "isp": "cmcc",
+  "log": "iptv-cmcc.log",
+  "x-tvg-url": "http://192.168.1.100/epg/iptv-cmcc-epg.xml",
+
+  "cmcc": {
+    "epg_days": 8
+  },
+
+  "m3u": ["iptv-cmcc.m3u"],
+  "epg": ["iptv-cmcc-epg.xml"]
+}
+```
+
+`cmcc` 各字段均可省略：
+
+- `epg_base`：频道/节目单接口基地址（内置默认值）
+- `lookback_base`：回看网关基地址（内置默认值）
+- `epg_days`：节目单天数，默认 8（前 6 天至明天）
+- `ability_string`：区域/能力标签，内置成都默认值，其他地市可按需覆盖（对象或字符串）
+- `yauth`：请求头，缺省按抓包格式自动生成；也可配置 `device_id`、`mac`、`version` 参与生成
+
+移动模式的输出差异：
+
+- 频道 `tvg-id` / EPG `channel id` 与电信模式一致，使用频道名
+- 回看为路径式模板，默认
+  `catchup-source=".../lookback/<uuid>/{utc:YmdHMS}/{utcend:YmdHMS}/1.m3u8"`，
+  仍可用 `catchup-format` 覆盖，例如 `${(b)yyyyMMddHHmmss}/${(e)yyyyMMddHHmmss}/1.m3u8`
+- 频道地址与 FCC 参数直接来自接口返回，`proxy`、`fcc` 等选项用法与电信模式一致
+
+注意：移动模式的 EPG 服务器仅在企业网内可达，需要在移动 IPTV 网络（或挂靠该网络的设备）上运行。
+
 ## 配置文件
 
-配置文件为 JSON 格式。必填字段：
+配置文件为 JSON 格式。电信模式（`isp` 缺省或 `"telecom"`）必填字段：
 
 - `userid`
 - `key`
