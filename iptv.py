@@ -379,17 +379,20 @@ class CMCCSetTopBox:
             self.epg_days = DEFAULT_CMCC_EPG_DAYS
         self.ability_string = self._build_ability_string(settings.get('ability_string'))
         self.yauth = str(settings.get('yauth') or '').strip()
-        # 回看网关：配置优先；缺省在拿到 chlist 后自动探测
-        self.lookback_base = str(settings.get('lookback_base') or '').strip().rstrip('/')
+        # 回看网关前缀：全自动发现（探测 + EPG 采集），非配置项
+        self.lookback_base = ''
         self.session = requests.Session()
         headers = {'User-Agent': 'gefo8(ysten) vfa5'}
         if self.yauth:
             headers['YAUTH'] = self.yauth
         self.headers = headers
         self._channel_list = []
+        # 回看网关自动发现：pglist backPlayUrl 里采集（前缀 + 频道真实回看id）
+        self._discovered_prefix = ''
+        self._catchup_ids = {}
         self.logger = logging.getLogger(f'{__name__}.{self.__class__.__name__}')
         self.logger.info('CMCC STB 初始化: epg_base=%s epg_days=%s lookback=%s',
-                         self.epg_base, self.epg_days, self.lookback_base or '待探测')
+                         self.epg_base, self.epg_days, self.lookback_base or '自动发现')
 
     # ------------------------------------------------------------------
     # helpers
@@ -405,14 +408,40 @@ class CMCCSetTopBox:
     def _random():
         return f'0.{random.randint(10 ** 8, 10 ** 9 - 1)}'
 
+    @staticmethod
+    def _split_lookback_url(url):
+        """拆 backPlayUrl -> (网关前缀, 回看频道id)。
+
+        模板: <前缀>/<id>/<起14位>/<止14位>/<节目id>.m3u8
+        id 与 chlist 的 uuid 可能不同（如 ysten-cctv-1 vs cctv-1），按服务器下发为准。
+        """
+        m = re.match(r'^(https?://.+)/([^/]+)/\d{14}/\d{14}/\d+\.m3u8$', str(url or '').strip())
+        return (m.group(1), m.group(2)) if m else ('', '')
+
+    def _extract_lookback(self, channel_id, data):
+        """从 pglist 响应采集回看网关前缀与该频道的真实回看 id。"""
+        for day in (data.get('content') or []):
+            for prog in (day.get('programs') or []):
+                candidates = [str(prog.get('backPlayUrl') or '')]
+                candidates += [str(res.get('backPlayUrl') or '')
+                               for res in (prog.get('resolution') or [])]
+                for url in candidates:
+                    prefix, cid = self._split_lookback_url(url)
+                    if not prefix:
+                        continue
+                    if not self._discovered_prefix:
+                        self._discovered_prefix = prefix
+                        self.logger.info('回看网关前缀自动发现: %s', prefix)
+                    if cid:
+                        self._catchup_ids[channel_id] = cid
+                    return
+
     # ------------------------------------------------------------------
     # 回看网关探测
     # ------------------------------------------------------------------
 
     def _resolve_lookback_base(self, content):
-        """回看网关前缀：配置优先；缺省用首个开时移频道的 pglist 探测一次。"""
-        if self.lookback_base:
-            return self.lookback_base
+        """回看网关前缀：探测一次（EPG 阶段还会继续采集兜底）。"""
         for item in (content.get('channels') or []):
             if str(item.get('isShowBack') or '0') == '0':
                 continue
@@ -423,13 +452,12 @@ class CMCCSetTopBox:
             if prefix:
                 self.logger.info('回看网关探测成功: %s', prefix)
             else:
-                self.logger.warning('回看网关探测失败，M3U 将不含回看地址；'
-                                    '可在配置中显式指定 cmcc.lookback_base')
+                self.logger.warning('回看网关探测失败，将在 EPG 阶段继续采集')
             return prefix
         return ''
 
     def _probe_lookback_base(self, channel_id):
-        """拉一次最小日期范围的 pglist，从 backPlayUrl 按 /<uuid>/ 切出网关前缀。"""
+        """拉一次最小日期范围的 pglist，按通用正则切出网关前缀（不依赖 uuid 匹配）。"""
         today = datetime.now(timezone(timedelta(hours=8)))
         try:
             data = self._request_json('/pglist', {
@@ -443,22 +471,17 @@ class CMCCSetTopBox:
         except IPTVError as e:
             self.logger.warning('[lookback探测] pglist 请求失败: %s', e)
             return ''
-        marker = f'/{channel_id}/'
         for day in (data.get('content') or []):
             for prog in (day.get('programs') or []):
-                back_url = str(prog.get('backPlayUrl') or '')
-                if not back_url:
-                    for res in (prog.get('resolution') or []):
-                        back_url = str(res.get('backPlayUrl') or '')
-                        if back_url:
-                            break
-                if not back_url:
-                    continue
-                head, sep, _tail = back_url.partition(marker)
-                if sep and head.startswith('http'):
-                    return head.rstrip('/')
-                self.logger.warning('[lookback探测] backPlayUrl 结构异常: %s', back_url)
-                return ''
+                candidates = [str(prog.get('backPlayUrl') or '')]
+                candidates += [str(res.get('backPlayUrl') or '')
+                               for res in (prog.get('resolution') or [])]
+                for url in candidates:
+                    prefix, cid = self._split_lookback_url(url)
+                    if prefix:
+                        if cid:
+                            self._catchup_ids.setdefault(channel_id, cid)
+                        return prefix
         self.logger.warning('[lookback探测] pglist 无节目或无 backPlayUrl (ch=%s)', channel_id)
         return ''
 
@@ -503,8 +526,11 @@ class CMCCSetTopBox:
             'random': self._random(),
         }, 'CMCC-chlist')
         if str(data.get('resultCode')) != '000':
+            hint = ('（COS-900 通常是 ability_string 缺失或组无效——'
+                    '实测空串与无效参数均返回此错误，最小可用形式 '
+                    '{"userGroupIds":["<组id>"]}' if str(data.get('resultCode')) == 'COS-900' else '')
             raise IPTVError(
-                f'chlist 返回错误: {data.get("resultCode")} {data.get("resultMessage")}',
+                f'chlist 返回错误: {data.get("resultCode")} {data.get("resultMessage")}{hint}',
                 label='cmcc_chlist')
 
         content = data.get('content') or {}
@@ -558,8 +584,8 @@ class CMCCSetTopBox:
             'fcc_ip': fcc_ip,
             'fcc_port': fcc_port,
             'fec_port': fec_port,
-            'catchup_prefix': (f'{self.lookback_base}/{channel_id}'
-                               if timeshift != '0' and self.lookback_base else ''),
+            # 回看前缀由 finalize_catchup 在 EPG 采集后统一回填（探测/采集失败则为空，优雅降级）
+            'catchup_prefix': '',
         }
 
     def get_channel_programs(self, channel_id):
@@ -577,6 +603,7 @@ class CMCCSetTopBox:
             self.logger.warning('[get_channel_programs] pglist 返回错误 (ch=%s): %s %s',
                                 channel_id, data.get('resultCode'), data.get('resultMessage'))
             return []
+        self._extract_lookback(channel_id, data)
 
         programs = []
         try:
@@ -596,6 +623,25 @@ class CMCCSetTopBox:
         except AttributeError as e:
             self.logger.error('[get_channel_programs] EPG数据遍历异常 (ch=%s): %s', channel_id, e)
         return programs
+
+    def finalize_catchup(self, channels):
+        """EPG 采集完成后回填回看前缀与各频道的真实回看 id。
+
+        频道 id 用 pglist backPlayUrl 里采集到的真实回看 id，未采集到则回退 uuid。
+        """
+        prefix = self.lookback_base or self._discovered_prefix
+        if not prefix:
+            self.logger.warning('回看网关前缀未发现，M3U 将不含回看地址')
+            return
+        filled = 0
+        for ch in channels:
+            if ch.get('timeshift') == '0':
+                continue
+            cid = self._catchup_ids.get(ch['id'], ch['id'])
+            ch['catchup_prefix'] = f'{prefix}/{cid}'
+            filled += 1
+        self.logger.info('回看前缀就绪: %s (覆盖 %d 频道, 其中 %d 个使用采集到的回看 id)',
+                         prefix, filled, len(self._catchup_ids))
 
 
 def classify(name):
@@ -1159,15 +1205,20 @@ if __name__ == '__main__':
         channels = _prepare_channels(stb.get_channel_list())
         m3u_targets = parse_m3u_targets(config, config_dir, config.get("x-tvg-url", ""))
         merge_m3u_channels = load_merge_m3u_channels(merge_m3u_sources)
+
+        # 先拉 EPG（移动模式顺带采集回看前缀/频道 id），m3u 生成依赖采集结果，故在其后
+        for epg_path in parse_epg_paths(config, config_dir):
+            generate_epg(stb, channels, epg_path, source_info_name=f'{isp_label}IPTV')
+            merge_epg(epg_path, merge_epg_sources)
+        finalize = getattr(stb, 'finalize_catchup', None)
+        if finalize:
+            finalize(channels)
+
         for target in m3u_targets:
             target['options'].setdefault('isp-label', isp_label)
             target['options'].setdefault('isp', isp)
             target_merge_channels = merge_m3u_channels if target['options'].get('merge') else []
             generate_m3u(channels, target['path'], target['options'], selected_channels, target_merge_channels)
-
-        for epg_path in parse_epg_paths(config, config_dir):
-            generate_epg(stb, channels, epg_path, source_info_name=f'{isp_label}IPTV')
-            merge_epg(epg_path, merge_epg_sources)
     except IPTVError as e:
         logger.error('IPTV 错误 [%s]: %s', e.label, e)
         sys.exit(1)

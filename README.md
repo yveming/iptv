@@ -41,7 +41,7 @@ python iptv.py
 
 ## 移动 IPTV
 
-配置文件设置 `"isp": "cmcc"` 即启用移动模式。频道与节目单来自移动侧 ysten EPG 接口（`chlist` / `pglist`），无需认证，电信模式的必填字段（`userid`、`key`、`stbid`、`login_entry`、`egp_uri`）全部不再需要，移动模式仅要求一个 `epg_base`：
+配置文件设置 `"isp": "cmcc"` 即启用移动模式。频道与节目单来自移动侧 ysten EPG 接口（`chlist` / `pglist`），无需认证，电信模式的必填字段（`userid`、`key`、`stbid`、`login_entry`、`egp_uri`）全部不再需要，移动模式仅要求 `epg_base` 和 `ability_string`：
 
 ```json
 {
@@ -50,7 +50,8 @@ python iptv.py
   "x-tvg-url": "http://192.168.1.100/epg/iptv-cmcc-epg.xml",
 
   "cmcc": {
-    "epg_base": "http://192.0.2.3:7070/ysten-wtv-epg/epg/wtv"
+    "epg_base": "http://192.0.2.3:7070/ysten-wtv-epg/epg/wtv",
+    "ability_string": {"userGroupIds": ["1362"]}
   },
 
   "m3u": ["iptv-cmcc.m3u"],
@@ -62,12 +63,14 @@ python iptv.py
 
 - 频道清单：`{epg_base}/chlist`
 - 节目单：`{epg_base}/pglist`（按频道逐个拉取）
-- 回看网关：自动从节目单 `backPlayUrl` 探测，无需配置
+- 回看网关：全自动发现——从节目单 `backPlayUrl` 探测 + EPG 采集，无需配置
 
 `cmcc` 其余字段均可省略：
 
-- `lookback_base`：回看网关前缀，配置后跳过自动探测
-- `ability_string`：区域/能力标签（决定接口返回哪些频道），缺省发空串（服务器按默认组返回）；对象或字符串均可
+- `ability_string`：**实测必配**——空串返回 `COS-900 无可用结果`。实测最小可用形式为
+  `{"userGroupIds": ["<组id>"]}`（组 id 来自抓包，如 `queryuserinfo` 下发的
+  usergroupid），与十余个字段的完整抓包值返回的频道集合完全一致，其余字段均可省；
+  服务端按自报的 `userGroupIds` 过滤频道
 - `yauth`：请求头原样字符串，缺省不发送（接口不校验签名）
 - `epg_days`：节目单天数，默认 8（前 6 天至明天）
 
@@ -75,7 +78,8 @@ python iptv.py
 
 - 频道 `tvg-id` / EPG `channel id` 与电信模式一致，使用频道名
 - 回看为路径式模板，默认
-  `catchup-source=".../lookback/<uuid>/{utc:YmdHMS}/{utcend:YmdHMS}/1.m3u8"`，
+  `catchup-source=".../lookback/<回看id>/{utc:YmdHMS}/{utcend:YmdHMS}/1.m3u8"`，
+  回看 id 取自 pglist `backPlayUrl`（可能与频道 uuid 不同）；
   仍可用 `catchup-format` 覆盖，例如 `${(b)yyyyMMddHHmmss}/${(e)yyyyMMddHHmmss}/1.m3u8`
 - 频道地址与 FCC 参数直接来自接口返回；`"fcc": true` 即输出 `fcc=<IP:端口>`
 - `proxy`、`merge` 等选项用法与电信模式一致
