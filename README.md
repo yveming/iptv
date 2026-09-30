@@ -212,8 +212,8 @@ python iptv.py
 - `merge`：是否合并 `merge.m3u` 中的外部源
 - `catchup-format`：回看 URL 的 `playseek` 参数格式
 - `proxy`：代理地址
-- `fcc`：FCC 参数开关/类型，可为 `true`、`"telecom"` 或 `"huawei"`
-- `fcc-type`：FCC 协议类型；也支持 `"fcc": true, "fcc-type": "telecom"` 的写法
+- `fcc`：FCC 参数开关/类型；`true` ≡ `"telecom"`（仅附加 `fcc=`），`"huawei"` 会附加 `fcc-type=huawei`
+- `fcc-type`：FCC 协议类型（telecom / huawei 两种标准实现，跨运营商适用）；也可 `"fcc": true, "fcc-type": "huawei"` 拆开写
 - `x-tvg-url`：EPG 地址，写入 `#EXTM3U x-tvg-url="..."`；未配置时回退使用顶层同名字段
 
 默认规则：
@@ -262,9 +262,14 @@ http://192.168.1.50:4022/rtp/239.94.0.31:5140?r2h-token=12345678&fcc=192.0.2.2:8
 
 `fcc` 支持：
 
-- `true`：输出 `fcc=FCC服务器IP:端口`。移动模式直接可用（FCC 服务器取自频道 URL 自带参数）；电信模式需配合 `fcc-type` 指定类型
-- `"telecom"`：输出 `fcc=FCC服务器IP:端口`，省略 `fcc-type`
+- `telecom` 与 `huawei` 是 FCC 协议的两种标准实现，电信 / 移动 IPTV 均可能采用
+  其中一种，与运营商无关
+- `true` ≡ `"telecom"`：输出 `fcc=FCC服务器IP:端口`，不附加 `fcc-type` 参数
 - `"huawei"`：输出 `fcc=FCC服务器IP:端口&fcc-type=huawei`
+- 也可拆开写：`"fcc": true, "fcc-type": "huawei"`
+- `fcc` 与 `proxy` 相互独立：可配合代理使用，也可直接附加在 rtp:// 地址上
+- 只有频道携带 FCC 服务器参数时才会附加（移动取自 chlist 频道 URL 内嵌参数、
+  电信取自频道表字段），缺失时静默省略
 
 也可以写成：
 
