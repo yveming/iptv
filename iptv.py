@@ -553,18 +553,21 @@ class CMCCSetTopBox:
 
         igmp_addr = ''
         fcc_ip = fcc_port = fec_port = ''
-        for candidate in (url, item.get('multicastUrl') or ''):
+        # FCC/FEC 参数可能分散在任一候选 URL（服务端按 abilityString 摆放字段），
+        # 因此不提前 break：地址取第一个非空候选，参数逐项从各候选补齐
+        for candidate in (url, item.get('multicastUrl') or '',
+                          resolution.get('multicastUrl') or resolution.get('url') or ''):
             if not candidate:
                 continue
             parts = urlsplit(candidate)
             if not parts.netloc:
                 continue
-            igmp_addr = parts.netloc.lstrip('@')  # 个别频道为 rtp://@239.x.x.x:5140
+            if not igmp_addr:
+                igmp_addr = parts.netloc.lstrip('@')  # 个别频道为 rtp://@239.x.x.x:5140
             query = parse_qs(parts.query)
-            fcc_ip = (query.get('ChannelFCCIP') or [''])[0]
-            fcc_port = (query.get('ChannelFCCPort') or [''])[0]
-            fec_port = (query.get('channelFECPort') or [''])[0]
-            break
+            fcc_ip = fcc_ip or (query.get('ChannelFCCIP') or [''])[0]
+            fcc_port = fcc_port or (query.get('ChannelFCCPort') or [''])[0]
+            fec_port = fec_port or (query.get('channelFECPort') or [''])[0]
 
         channel_id = str(item.get('uuid') or '').strip()
         if not channel_id or not igmp_addr:
@@ -704,20 +707,22 @@ def _m3u_channel_url(ch, options):
 
     source_url = f'rtp://{ch["igmp_addr"]}'
     proxy = options.get('proxy', '')
-    if not proxy:
-        return source_url
+    url = _proxy_base_url(proxy, source_url) if proxy else source_url
 
-    url = _proxy_base_url(proxy, source_url)
+    # fcc 与 proxy 相互独立：有无代理均可附加在播放地址上。
+    # true 等价 "telecom"（仅附加 fcc=，不附加 fcc-type=）；telecom/huawei 是
+    # FCC 协议的两种标准实现，与运营商无关
     fcc_value = options.get('fcc')
-    fcc_type = str(options.get('fcc-type') or (fcc_value if isinstance(fcc_value, str) else '')).lower()
-    if fcc_value and not fcc_type and options.get('isp') == 'cmcc':
-        fcc_type = 'telecom'  # fcc: true — 移动侧仅附加 fcc= 参数（取自频道 URL 自带参数）
-    if fcc_value and fcc_type in VALID_FCC_TYPES:
-        fcc_addr = f'{ch.get("fcc_ip", "")}:{ch.get("fcc_port", "")}'
-        if ch.get('fcc_enable') != '0' and ch.get('fcc_ip') and ch.get('fcc_port'):
-            url = _append_query(url, f'fcc={fcc_addr}')
-            if fcc_type != 'telecom':
-                url = _append_query(url, f'fcc-type={fcc_type}')
+    if not fcc_value:
+        return url
+    fcc_type = str(options.get('fcc-type') or ('telecom' if fcc_value is True else fcc_value)).lower()
+    if fcc_type not in VALID_FCC_TYPES:
+        return url
+    if ch.get('fcc_enable') == '0' or not ch.get('fcc_ip') or not ch.get('fcc_port'):
+        return url  # 频道未下发 FCC 服务器参数，静默省略
+    url = _append_query(url, f'fcc={ch["fcc_ip"]}:{ch["fcc_port"]}')
+    if fcc_type != 'telecom':
+        url = _append_query(url, f'fcc-type={fcc_type}')
     return url
 
 
