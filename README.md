@@ -41,7 +41,7 @@ python iptv.py
 
 ## 移动 IPTV
 
-配置文件设置 `"isp": "cmcc"` 即启用移动模式。频道与节目单来自移动侧 ysten EPG 接口（`chlist` / `pglist`），无需认证，电信模式的必填字段（`userid`、`key`、`stbid`、`login_entry`、`egp_uri`）全部不再需要：
+配置文件设置 `"isp": "cmcc"` 即启用移动模式。频道与节目单来自移动侧 ysten EPG 接口（`chlist` / `pglist`），无需认证，电信模式的必填字段（`userid`、`key`、`stbid`、`login_entry`、`egp_uri`）全部不再需要，移动模式仅要求一个 `epg_base`：
 
 ```json
 {
@@ -50,7 +50,7 @@ python iptv.py
   "x-tvg-url": "http://192.168.1.100/epg/iptv-cmcc-epg.xml",
 
   "cmcc": {
-    "epg_days": 8
+    "epg_base": "http://192.0.2.3:7070/ysten-wtv-epg/epg/wtv"
   },
 
   "m3u": ["iptv-cmcc.m3u"],
@@ -58,13 +58,18 @@ python iptv.py
 }
 ```
 
-`cmcc` 各字段均可省略：
+`epg_base` 为 ysten EPG 服务基地址（含部署路径），各地市不同，需通过抓包获取。以下地址均由它派生，无需单独配置：
 
-- `epg_base`：频道/节目单接口基地址（内置默认值）
-- `lookback_base`：回看网关基地址（内置默认值）
+- 频道清单：`{epg_base}/chlist`
+- 节目单：`{epg_base}/pglist`（按频道逐个拉取）
+- 回看网关：自动从节目单 `backPlayUrl` 探测，无需配置
+
+`cmcc` 其余字段均可省略：
+
+- `lookback_base`：回看网关前缀，配置后跳过自动探测
+- `ability_string`：区域/能力标签（决定接口返回哪些频道），缺省发空串（服务器按默认组返回）；对象或字符串均可
+- `yauth`：请求头原样字符串，缺省不发送（接口不校验签名）
 - `epg_days`：节目单天数，默认 8（前 6 天至明天）
-- `ability_string`：区域/能力标签，内置成都默认值，其他地市可按需覆盖（对象或字符串）
-- `yauth`：请求头，缺省按抓包格式自动生成；也可配置 `device_id`、`mac`、`version` 参与生成
 
 移动模式的输出差异：
 
@@ -72,7 +77,8 @@ python iptv.py
 - 回看为路径式模板，默认
   `catchup-source=".../lookback/<uuid>/{utc:YmdHMS}/{utcend:YmdHMS}/1.m3u8"`，
   仍可用 `catchup-format` 覆盖，例如 `${(b)yyyyMMddHHmmss}/${(e)yyyyMMddHHmmss}/1.m3u8`
-- 频道地址与 FCC 参数直接来自接口返回，`proxy`、`fcc` 等选项用法与电信模式一致
+- 频道地址与 FCC 参数直接来自接口返回；`"fcc": true` 即输出 `fcc=<IP:端口>`
+- `proxy`、`merge` 等选项用法与电信模式一致
 
 注意：移动模式的 EPG 服务器仅在企业网内可达，需要在移动 IPTV 网络（或挂靠该网络的设备）上运行。
 
@@ -143,6 +149,8 @@ python iptv.py
 }
 ```
 
+> 示例中的服务器地址（`192.0.2.x` 等）均为文档占位，实际的认证入口、EPG 接口以抓包或运营商提供为准。
+
 ### 认证字段
 
 程序会在 `IPTVSetTopBox` 内部生成认证表单数据。配置中的：
@@ -200,7 +208,7 @@ python iptv.py
 - `merge`：是否合并 `merge.m3u` 中的外部源
 - `catchup-format`：回看 URL 的 `playseek` 参数格式
 - `proxy`：代理地址
-- `fcc`：FCC 协议类型，可为 `"telecom"` 或 `"huawei"`
+- `fcc`：FCC 参数开关/类型，可为 `true`、`"telecom"` 或 `"huawei"`
 - `fcc-type`：FCC 协议类型；也支持 `"fcc": true, "fcc-type": "telecom"` 的写法
 - `x-tvg-url`：EPG 地址，写入 `#EXTM3U x-tvg-url="..."`；未配置时回退使用顶层同名字段
 
@@ -250,6 +258,7 @@ http://192.168.1.50:4022/rtp/239.94.0.31:5140?r2h-token=12345678&fcc=192.0.2.2:8
 
 `fcc` 支持：
 
+- `true`：输出 `fcc=FCC服务器IP:端口`。移动模式直接可用（FCC 服务器取自频道 URL 自带参数）；电信模式需配合 `fcc-type` 指定类型
 - `"telecom"`：输出 `fcc=FCC服务器IP:端口`，省略 `fcc-type`
 - `"huawei"`：输出 `fcc=FCC服务器IP:端口&fcc-type=huawei`
 
