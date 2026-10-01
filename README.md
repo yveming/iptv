@@ -4,16 +4,13 @@
 
 ## 功能
 
-- 模拟 IPTV 机顶盒认证流程（电信）
-- 支持移动 IPTV（ysten EPG，免认证直连频道/节目单接口）
-- 生成 M3U 直播播放列表
+- 模拟电信 IPTV 机顶盒认证流程
+- 支持电信/移动 IPTV，自动生成 M3U 直播播放列表和 XMLTV EPG 节目单，包括 `.xml` 和 `.gz` 格式
 - 支持一次运行输出多个 M3U 文件
 - 支持按频道名关键词生成精选 M3U
-- 精选频道支持模糊匹配，并按 `selected.channels` 的顺序输出
+- 精选频道支持模糊匹配，并按选定顺序输出
 - 精选频道写入 M3U 时可替换显示名，且不改变 `tvg-id` / `tvg-name`
-- 支持代理播放地址和 FCC 参数输出
-- 生成 XMLTV EPG 节目单，并自动生成 `.gz` 压缩文件
-- 通过 JSON 配置认证信息、认证入口、EPG 接口和输出路径
+- 支持代理播放地址和 FCC 参数配置
 - 支持合并外部 M3U / EPG 到最终输出文件
 - 外部合并源支持本地文件和 `http://` / `https://` 远程文件
 
@@ -51,7 +48,7 @@ python iptv.py
 
   "cmcc": {
     "epg_base": "http://192.0.2.3:7070/ysten-wtv-epg/epg/wtv",
-    "ability_string": {"userGroupIds": ["1362"]}
+    "ability_string": {"userGroupIds": ["xxxx"]}
   },
 
   "m3u": ["iptv-cmcc.m3u"],
@@ -59,30 +56,20 @@ python iptv.py
 }
 ```
 
-`epg_base` 为 ysten EPG 服务基地址（含部署路径），各地市不同，需通过抓包获取。以下地址均由它派生，无需单独配置：
-
-- 频道清单：`{epg_base}/chlist`
-- 节目单：`{epg_base}/pglist`（按频道逐个拉取）
-- 回看网关：全自动发现——从节目单 `backPlayUrl` 探测 + EPG 采集，无需配置
+`epg_base` 为ysten服务基地址，各地市不同，需通过抓包获取。
 
 `cmcc` 其余字段均可省略：
 
-- `ability_string`：**实测必配**——空串返回 `COS-900 无可用结果`。实测最小可用形式为
+- `ability_string`：**实测必配**——空串返回 `COS-900 无可用结果`。最小可用形式为
   `{"userGroupIds": ["<组id>"]}`（组 id 来自抓包，如 `queryuserinfo` 下发的
-  usergroupid），与十余个字段的完整抓包值返回的频道集合完全一致，其余字段均可省；
-  服务端按自报的 `userGroupIds` 过滤频道
-- `yauth`：请求头原样字符串，缺省不发送（接口不校验签名）
-- `epg_days`：节目单天数，默认 8（前 6 天至明天）
+  usergroupid）
 
 移动模式的输出差异：
 
-- 频道 `tvg-id` / EPG `channel id` 与电信模式一致，使用频道名
 - 回看为路径式模板，默认
   `catchup-source=".../lookback/<回看id>/{utc:YmdHMS}/{utcend:YmdHMS}/1.m3u8"`，
   回看 id 取自 pglist `backPlayUrl`（可能与频道 uuid 不同）；
   仍可用 `catchup-format` 覆盖，例如 `${(b)yyyyMMddHHmmss}/${(e)yyyyMMddHHmmss}/1.m3u8`
-- 频道地址与 FCC 参数直接来自接口返回；`"fcc": true` 即输出 `fcc=<IP:端口>`
-- `proxy`、`merge` 等选项用法与电信模式一致
 
 注意：移动模式的 EPG 服务器仅在企业网内可达，需要在移动 IPTV 网络（或挂靠该网络的设备）上运行。
 
@@ -103,7 +90,7 @@ python iptv.py
 {
   "userid": "UserID@ITV",
   "key": "12345678",
-  "stbid": "12345678890123456",
+  "stbid": "1234567890123456",
   "mac": "11:22:33:44:55:66",
   "login_entry": "http://192.0.2.1:8082/EDS/jsp/AuthenticationURL",
   "egp_uri": "/EPG/jsp/liveplay_30/en/getTvodData.jsp",
@@ -262,12 +249,11 @@ http://192.168.1.50:4022/rtp/239.94.0.31:5140?r2h-token=12345678&fcc=192.0.2.2:8
 
 `fcc` 支持：
 
-- `telecom` 与 `huawei` 是 FCC 协议的两种标准实现，电信 / 移动 IPTV 均可能采用
+- `telecom` 与 `huawei` 是 FCC 协议的两种实现，电信 / 移动 IPTV 均可能采用
   其中一种，与运营商无关
 - `true` ≡ `"telecom"`：输出 `fcc=FCC服务器IP:端口`，不附加 `fcc-type` 参数
 - `"huawei"`：输出 `fcc=FCC服务器IP:端口&fcc-type=huawei`
 - 也可拆开写：`"fcc": true, "fcc-type": "huawei"`
-- `fcc` 与 `proxy` 相互独立：可配合代理使用，也可直接附加在 rtp:// 地址上
 - 只有频道携带 FCC 服务器参数时才会附加（移动取自 chlist 频道 URL 内嵌参数、
   电信取自频道表字段），缺失时静默省略
 
@@ -275,7 +261,6 @@ http://192.168.1.50:4022/rtp/239.94.0.31:5140?r2h-token=12345678&fcc=192.0.2.2:8
 
 ```json
 {
-  "proxy": "http://192.168.1.50:4022?r2h-token=12345678",
   "fcc": true,
   "fcc-type": "huawei"
 }
