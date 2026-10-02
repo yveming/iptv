@@ -41,6 +41,9 @@ DEFAULT_CMCC_CATCHUP_FORMAT = '{utc:YmdHMS}/{utcend:YmdHMS}/1.m3u8'
 DEFAULT_CMCC_EPG_DAYS = 8
 VALID_FCC_TYPES = ('huawei', 'telecom')
 VALID_ISP_TYPES = ('telecom', 'cmcc')
+AUTH_RETRY_TIMES = 3       # 频道列表认证失败时的最大尝试次数
+AUTH_RETRY_BACKOFF = 2     # 认证重试的基础退避秒数（按次指数增长）
+EPG_REAUTH_RETRIES = 2     # EPG 请求遇到会话超时时的最大尝试次数
 
 
 class IPTVError(Exception):
@@ -129,6 +132,35 @@ class IPTVSetTopBox:
         resp = self._auth(resp)
         resp = self._get_channel_list(resp)
         self.logger.info('认证流程完成')
+        return resp
+
+    @staticmethod
+    def _is_session_timeout(resp):
+        """判断响应是否为 EPG 的“会话超时/需重新登录”页面。"""
+        if resp is None:
+            return False
+        url = getattr(resp, 'url', '') or ''
+        if 'SessionTimeOut' in url or 'errorCode=' in url:
+            return True
+        text = getattr(resp, 'text', '') or ''
+        return 'SessionTimeOut' in text or 'resignon' in text
+
+    def _reset_session(self):
+        """重建 HTTP 会话，丢弃已失效的 cookie/连接。"""
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = requests.Session()
+        self.headers.pop('Referer', None)
+        self._last_url = self.login_entry
+
+    def _reauth(self):
+        """会话失效后重建会话并重新认证；仍超时则抛出异常。"""
+        self._reset_session()
+        resp = self._authenticate()
+        if self._is_session_timeout(resp):
+            raise IPTVError('重新认证后仍会话超时', label='reauth')
         return resp
 
     def _login(self, resp):
@@ -286,23 +318,54 @@ class IPTVSetTopBox:
         if self._channel_list:
             return self._channel_list
 
-        resp = self._authenticate()
-        try:
-            for match in CHANNEL_PATTERN.finditer(resp.text):
-                g = match.groups()
-                self._channel_list.append({
-                    'id': g[0], 'name': g[1], 'user_channel_id': g[2], 'igmp_addr': g[3],
-                    'timeshift': g[4], 'timeshift_len': g[5], 'timeshift_url': g[6],
-                    'fcc_enable': g[7], 'fcc_ip': g[8], 'fcc_port': g[9], 'fec_port': g[10]
-                })
-        except Exception as e:
-            self.logger.error('[get_channel_list] 频道解析失败: %s', e)
+        last_resp = None
+        for attempt in range(1, AUTH_RETRY_TIMES + 1):
+            if attempt > 1:
+                delay = AUTH_RETRY_BACKOFF ** (attempt - 1)
+                self.logger.warning(
+                    '[get_channel_list] 第 %s/%s 次尝试：重建会话并重新认证，%ss 后重试',
+                    attempt, AUTH_RETRY_TIMES, delay)
+                time.sleep(delay)
+                self._reset_session()
+
+            last_resp = None
+            try:
+                last_resp = self._authenticate()
+            except IPTVError as e:
+                self.logger.warning('[get_channel_list] 认证过程出错 (%s)', e)
+                if attempt >= AUTH_RETRY_TIMES:
+                    raise
+                continue
+
+            if self._is_session_timeout(last_resp):
+                self.logger.warning(
+                    '[get_channel_list] 认证返回会话超时页 (url=%s)，本次失败',
+                    last_resp.url)
+                continue
+
+            try:
+                for match in CHANNEL_PATTERN.finditer(last_resp.text):
+                    g = match.groups()
+                    self._channel_list.append({
+                        'id': g[0], 'name': g[1], 'user_channel_id': g[2], 'igmp_addr': g[3],
+                        'timeshift': g[4], 'timeshift_len': g[5], 'timeshift_url': g[6],
+                        'fcc_enable': g[7], 'fcc_ip': g[8], 'fcc_port': g[9], 'fec_port': g[10]
+                    })
+            except Exception as e:
+                self.logger.error('[get_channel_list] 频道解析失败: %s', e)
+
+            if self._channel_list:
+                break
+            self.logger.warning(
+                '[get_channel_list] 未解析到频道 (url=%s, status=%s, len=%s)，准备重试',
+                last_resp.url, last_resp.status_code, len(last_resp.text))
+
         if not self._channel_list:
             self.logger.error(
                 '[get_channel_list] 未获取到频道列表，保留已有输出 (url=%s, status=%s, len=%s, content-type=%s)',
-                resp.url, resp.status_code, len(resp.text),
-                resp.headers.get('Content-Type', ''))
-            self.logger.error('[get_channel_list] 原始响应前 1000 字符: %r', resp.text[:1000])
+                last_resp.url, last_resp.status_code, len(last_resp.text),
+                last_resp.headers.get('Content-Type', ''))
+            self.logger.error('[get_channel_list] 原始响应前 1000 字符: %r', last_resp.text[:1000])
             raise IPTVError('未获取到频道列表', label='get_channel_list')
         self.logger.info('频道列表获取完成: %s 个频道', len(self._channel_list))
         return self._channel_list
@@ -314,11 +377,33 @@ class IPTVSetTopBox:
         """
         if self._channel_list is None:
             self.get_channel_list()
-        url = urljoin(self._last_url, f'{self.egp_uri}?channelId={channel_id}')
-        self.headers['Referer'] = url
-        resp = _safe_http('GET', url, session=self.session,
-                          log_label=f'EPG(ch={channel_id})',
-                          headers=self.headers)
+
+        resp = None
+        for attempt in range(1, EPG_REAUTH_RETRIES + 1):
+            url = urljoin(self._last_url, f'{self.egp_uri}?channelId={channel_id}')
+            self.headers['Referer'] = url
+            try:
+                resp = _safe_http('GET', url, session=self.session,
+                                  log_label=f'EPG(ch={channel_id})',
+                                  headers=self.headers)
+            except IPTVError:
+                if attempt < EPG_REAUTH_RETRIES:
+                    self.logger.warning(
+                        '[get_channel_programs] 请求失败，重新认证后重试 (ch=%s)', channel_id)
+                    self._reauth()
+                    continue
+                raise
+            if self._is_session_timeout(resp):
+                if attempt < EPG_REAUTH_RETRIES:
+                    self.logger.warning(
+                        '[get_channel_programs] 会话超时，重新认证后重试 (ch=%s)', channel_id)
+                    self._reauth()
+                    continue
+                self.logger.warning(
+                    '[get_channel_programs] 会话超时且重试失败 (ch=%s)', channel_id)
+                return []
+            break
+
         try:
             match = re.search(r'parent\.jsonBackLookStr\s*=\s*(\[.*?\]);', resp.text)
         except Exception as e:
@@ -917,7 +1002,11 @@ def generate_epg(box, channels, filepath='iptv-epg.xml', source_info_name='电�
         )
         tv_root.set('source-info-name', source_info_name)
         for ch in channels:
-            programs = box.get_channel_programs(ch['id'])
+            try:
+                programs = box.get_channel_programs(ch['id'])
+            except IPTVError as e:
+                logger.warning('[generate_epg] 跳过频道 %s（%s）: %s', ch['name'], ch['id'], e)
+                continue
             if not programs:
                 continue
             chan_elem = etree.SubElement(tv_root, 'channel', id=ch['name'])
