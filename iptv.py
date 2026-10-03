@@ -833,6 +833,18 @@ def _catchup_attr(ch, options):
         # 电信: 查询串式回看 ...?playseek=<开始>-<结束>
         catchup_format = str(options.get('catchup-format', DEFAULT_CATCHUP_FORMAT)).lstrip('?&')
         source = f'{ch["timeshift_url"]}?{catchup_format}'
+    catchup_proxy = options.get('catchup-proxy', False)
+    if isinstance(catchup_proxy, str):
+        catchup_proxy = catchup_proxy.strip().lower() in ('true', '1', 'yes')
+    proxy = options.get('proxy', '')
+    if catchup_proxy and proxy:
+        scheme = urlparse(source).scheme.lower()
+        if scheme in ('rtp', 'rtsp', 'http'):
+            source_query = urlparse(source).query
+            source = _append_query(_proxy_base_url(proxy, source), source_query)
+        else:
+            logger = logging.getLogger(__name__)
+            logger.warning('[catchup-proxy] 不支持的回看类型 %r，回退原始地址: %s', scheme or '(无)', source)
     return (
         f' catchup="default" catchup-days="7"'
         f' catchup-source="{source}"'

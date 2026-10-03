@@ -198,6 +198,7 @@ python iptv.py
 - `selected`：是否只输出精选频道
 - `merge`：是否合并 `merge.m3u` 中的外部源
 - `catchup-format`：回看 URL 的 `playseek` 参数格式
+- `catchup-proxy`：回看地址是否走 `proxy` 代理，默认 `false`；为 `true` 且配置了 `proxy` 时，`catchup-source` 按回看类型改写代理中间段：`rtp` → `/rtp/`、`rtsp` → `/rtsp/`、`http` → `/http/`；`https` 及其他类型不支持，回退原始地址
 - `proxy`：代理地址
 - `fcc`：FCC 参数开关/类型；`true` ≡ `"telecom"`（仅附加 `fcc=`），`"huawei"` 会附加 `fcc-type=huawei`
 - `fcc-type`：FCC 协议类型（telecom / huawei 两种标准实现，跨运营商适用）；也可 `"fcc": true, "fcc-type": "huawei"` 拆开写
