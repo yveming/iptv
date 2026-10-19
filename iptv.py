@@ -818,6 +818,22 @@ def _merge_channel_url(source_url, options):
     return _proxy_base_url(proxy, source_url)
 
 
+def _apply_catchup_proxy(source, options):
+    catchup_proxy = options.get('catchup-proxy', False)
+    if isinstance(catchup_proxy, str):
+        catchup_proxy = catchup_proxy.strip().lower() in ('true', '1', 'yes')
+    proxy = options.get('proxy', '')
+    if not catchup_proxy or not proxy:
+        return source
+    scheme = urlparse(source).scheme.lower()
+    if scheme not in ('rtp', 'rtsp', 'http'):
+        logger = logging.getLogger(__name__)
+        logger.warning('[catchup-proxy] 不支持的回看类型 %r，回退原始地址: %s', scheme or '(无)', source)
+        return source
+    source_query = urlparse(source).query
+    return _append_query(_proxy_base_url(proxy, source), source_query)
+
+
 def _catchup_attr(ch, options):
     if ch.get('timeshift') == '0':
         return ''
@@ -833,22 +849,20 @@ def _catchup_attr(ch, options):
         # 电信: 查询串式回看 ...?playseek=<开始>-<结束>
         catchup_format = str(options.get('catchup-format', DEFAULT_CATCHUP_FORMAT)).lstrip('?&')
         source = f'{ch["timeshift_url"]}?{catchup_format}'
-    catchup_proxy = options.get('catchup-proxy', False)
-    if isinstance(catchup_proxy, str):
-        catchup_proxy = catchup_proxy.strip().lower() in ('true', '1', 'yes')
-    proxy = options.get('proxy', '')
-    if catchup_proxy and proxy:
-        scheme = urlparse(source).scheme.lower()
-        if scheme in ('rtp', 'rtsp', 'http'):
-            source_query = urlparse(source).query
-            source = _append_query(_proxy_base_url(proxy, source), source_query)
-        else:
-            logger = logging.getLogger(__name__)
-            logger.warning('[catchup-proxy] 不支持的回看类型 %r，回退原始地址: %s', scheme or '(无)', source)
+    source = _apply_catchup_proxy(source, options)
     return (
         f' catchup="default" catchup-days="7"'
         f' catchup-source="{source}"'
     )
+
+
+def _external_catchup_attr(ch, options):
+    attrs = dict(ch.get('catchup_attrs') or {})
+    if not attrs.get('catchup') and not attrs.get('catchup-source'):
+        return ''
+    if attrs.get('catchup-source'):
+        attrs['catchup-source'] = _apply_catchup_proxy(attrs['catchup-source'], options)
+    return ''.join(f' {key}="{value}"' for key, value in attrs.items())
 
 
 def _write_m3u_channels(filepath, channels, options=None):
@@ -857,13 +871,17 @@ def _write_m3u_channels(filepath, channels, options=None):
         print(_m3u_header(options.get("x-tvg-url", ""), options.get("isp-label", "电信")), file=fp)
         for ch in channels:
             group_title = ch.get('group_title') or classify(ch['name'])
-            catchup = _catchup_attr(ch, options) if 'timeshift' in ch else ''
+            if 'timeshift' in ch:
+                catchup = _catchup_attr(ch, options)
+            else:
+                catchup = _external_catchup_attr(ch, options)
             display_name = ch.get('display_name') or ch['name']
             tvg_id = ch.get('tvg_id') or ch['name']
             tvg_name = ch.get('tvg_name') or ch['name']
-            for prop in ch.get('props', []):
+            props = ch.get('props', [])
+            for prop in props:
                 fp.write(f'{prop}\n')
-            if catchup:
+            if catchup and not any('inputstream=inputstream.ffmpegdirect' in prop for prop in props):
                 fp.write('#KODIPROP:inputstream=inputstream.ffmpegdirect\n')
             fp.write(
                 f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{tvg_name}"'
@@ -957,6 +975,10 @@ def _select_channels(channels, selected_channels):
             continue
         item = channels[match_index].copy()
         item['display_name'] = selected_name
+        if item.get('merged'):
+            item['name'] = selected_name
+            item['tvg_id'] = selected_name
+            item['tvg_name'] = selected_name
         result.append(item)
         used_indexes.add(match_index)
     return result
@@ -1145,7 +1167,7 @@ def _parse_m3u_channels(text):
         tvg_name = current_attrs.get('tvg-name', '').strip()
         display_name = current_display or tvg_name or tvg_id or line
         name = tvg_name or tvg_id or display_name
-        channels.append({
+        channel = {
             'name': name,
             'display_name': display_name,
             'tvg_id': tvg_id or name,
@@ -1153,7 +1175,14 @@ def _parse_m3u_channels(text):
             'group_title': current_attrs.get('group-title', ''),
             'url': line,
             'props': pending_props,
-        })
+        }
+        catchup_attrs = {
+            key: value for key, value in current_attrs.items()
+            if key == 'catchup' or key.startswith('catchup-')
+        }
+        if catchup_attrs:
+            channel['catchup_attrs'] = catchup_attrs
+        channels.append(channel)
         pending_props = []
         current_attrs = None
         current_display = ''
@@ -1169,6 +1198,8 @@ def load_merge_m3u_channels(sources):
             continue
         text = data.decode('utf-8-sig', errors='ignore')
         source_channels = _parse_m3u_channels(text)
+        for channel in source_channels:
+            channel['merged'] = True
         channels.extend(source_channels)
         logger.info('已读取合并 M3U: %s (%s 个频道)', source, len(source_channels))
     return channels
