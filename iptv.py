@@ -44,6 +44,23 @@ VALID_ISP_TYPES = ('telecom', 'cmcc')
 AUTH_RETRY_TIMES = 3       # 频道列表认证失败时的最大尝试次数
 AUTH_RETRY_BACKOFF = 2     # 认证重试的基础退避秒数（按次指数增长）
 EPG_REAUTH_RETRIES = 2     # EPG 请求遇到会话超时时的最大尝试次数
+MERGE_RETRY_TIMES = 3      # 远程合并源获取失败时的尝试次数
+MERGE_RETRY_BACKOFF = 2    # 远程合并源重试退避秒数
+
+# 电信认证最终响应中的频道表行格式
+TELECOM_CHANNEL_PATTERN = re.compile(
+    r'ChannelID\=\"(\d+)\",'
+    r'ChannelName\=\"(.+?)\",'
+    r'UserChannelID\=\"(\d+)\",'
+    r'ChannelURL=\"igmp://(.+?)\".+?'
+    r'TimeShift\=\"(\d+)\",'
+    r'TimeShiftLength\=\"(\d+)\".+?,'
+    r'TimeShiftURL\=\"(.+?)\?.+?'
+    r'FCCEnable\=\"(\d+)\",'
+    r'ChannelFCCIP\=\"(.*?)\",'
+    r'ChannelFCCPort\=\"(.*?)\",'
+    r'ChannelFECPort\=\"(.*?)\"'
+)
 
 
 class IPTVError(Exception):
@@ -86,7 +103,106 @@ def _safe_http(method, url, session=None, log_label='', **kwargs):
 # 核心类
 # ---------------------------------------------------------------------------
 
-class IPTVSetTopBox:
+# 回看样式：'query' 电信查询串式（...?playseek=...）/ 'path' 移动路径式
+# （.../lookback/<id>/<起>/<止>/1.m3u8）/ 'attrs' 外部合并频道自带回看属性
+CATCHUP_STYLE_QUERY = 'query'
+CATCHUP_STYLE_PATH = 'path'
+CATCHUP_STYLE_ATTRS = 'attrs'
+
+
+def _make_channel(cid, name, igmp_addr, catchup_style, *, user_channel_id='',
+                  timeshift='0', timeshift_len='', timeshift_url='',
+                  fcc_enable='0', fcc_ip='', fcc_port='', fec_port='',
+                  catchup_prefix=''):
+    """构造统一结构的频道 dict，供电信/移动数据源与 M3U/EPG 输出管线共用。"""
+    return {
+        'id': cid, 'name': name, 'user_channel_id': user_channel_id,
+        'igmp_addr': igmp_addr, 'timeshift': timeshift, 'timeshift_len': timeshift_len,
+        'timeshift_url': timeshift_url, 'fcc_enable': fcc_enable,
+        'fcc_ip': fcc_ip, 'fcc_port': fcc_port, 'fec_port': fec_port,
+        'catchup_style': catchup_style, 'catchup_prefix': catchup_prefix,
+    }
+
+
+class SetTopBox:
+    """机顶盒基类：统一会话管理、频道缓存与取数流程（模板方法）。
+
+    子类通过覆写以下钩子接入不同运营商流程：
+      _authenticate()            认证钩子，返回认证最终响应；免认证流程沿用
+                                 默认空实现（返回 None），将来需要认证时在子类
+                                 覆写即可，取数流程无需改动
+      _fetch_channel_list(resp)  拉取并解析频道列表，返回频道 dict 列表；
+                                 无数据时返回空列表（重试与报错由基类统一处理）
+      _reset_session()           重试前的会话复位，默认空实现
+      finalize_catchup(channels) EPG 采集完成后的收尾钩子，默认空实现
+    """
+
+    list_error_label = 'get_channel_list'  # IPTVError.label，供调用方定位阶段
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.headers = {}
+        self._channel_list = []
+        self.logger = logging.getLogger(f'{__name__}.{self.__class__.__name__}')
+
+    def _authenticate(self):
+        """认证钩子：免认证流程返回 None，需要认证的子类覆写。"""
+        return None
+
+    def _fetch_channel_list(self, resp):
+        """拉取并解析频道列表，返回 list[dict]；无数据时返回空列表。"""
+        raise NotImplementedError
+
+    def _reset_session(self):
+        """重试前复位会话状态，默认空实现（无状态流程无需复位）。"""
+
+    def finalize_catchup(self, channels):
+        """EPG 采集完成后的收尾钩子（如回看信息回填），默认空实现。"""
+
+    @staticmethod
+    def _sanitize_title(title):
+        # < > 转全角避免下游解析问题；& 由 ElementTree 序列化时自行转义，勿手工替换（会二次转义）
+        return str(title).replace('<', '《').replace('>', '》')
+
+    @staticmethod
+    def _make_program(channel_id, start, stop, title):
+        return {'start': start, 'stop': stop, 'title': title, 'channel_id': channel_id}
+
+    def get_channel_list(self):
+        """模板方法：认证 -> 拉取频道列表，带重试/退避与缓存。"""
+        if self._channel_list:
+            return self._channel_list
+
+        channels = []
+        for attempt in range(1, AUTH_RETRY_TIMES + 1):
+            if attempt > 1:
+                delay = AUTH_RETRY_BACKOFF ** (attempt - 1)
+                self.logger.warning(
+                    '[get_channel_list] 第 %s/%s 次尝试：复位会话重新获取，%ss 后重试',
+                    attempt, AUTH_RETRY_TIMES, delay)
+                time.sleep(delay)
+                self._reset_session()
+            try:
+                channels = self._fetch_channel_list(self._authenticate())
+            except IPTVError as e:
+                self.logger.warning('[get_channel_list] 获取过程出错 (%s)', e)
+                if attempt >= AUTH_RETRY_TIMES:
+                    raise
+                continue
+            if channels:
+                break
+            self.logger.warning('[get_channel_list] 未解析到频道，准备重试 (%s/%s)',
+                                attempt, AUTH_RETRY_TIMES)
+
+        if not channels:
+            self.logger.error('[get_channel_list] 未获取到频道列表，保留已有输出')
+            raise IPTVError('未获取到频道列表', label=self.list_error_label)
+        self._channel_list = channels
+        self.logger.info('频道列表获取完成: %s 个频道', len(channels))
+        return self._channel_list
+
+
+class IPTVSetTopBox(SetTopBox):
     """Simulates a set-top box: authenticates, retrieves channel list and EPG data."""
 
     def __init__(
@@ -98,6 +214,7 @@ class IPTVSetTopBox:
         login_entry,
         egp_uri,
     ):
+        super().__init__()
         self.user_id = user_id
         self.key = key
         self.stb_id = stb_id
@@ -106,13 +223,10 @@ class IPTVSetTopBox:
         self.login_entry = login_entry
         self.egp_uri = egp_uri
         self.reserved = ''
-        self.session = requests.Session()
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (X11; U; Linux i686; en-US) AppleWebKit/534.0 (KHTML, like Gecko)',
         }
         self._last_url = login_entry
-        self._channel_list = []
-        self.logger = logging.getLogger(f'{__name__}.{self.__class__.__name__}')
         self.logger.info('STB 初始化: user=...%s stb=...%s ip=%s', self.user_id[-8:], self.stb_id[-12:], self.ip)
 
     # ------------------------------------------------------------------
@@ -295,89 +409,42 @@ class IPTVSetTopBox:
     # public API
     # ------------------------------------------------------------------
 
-    def get_channel_list(self):
-        """Authenticate (if needed) and return the full channel list.
+    def _fetch_channel_list(self, resp):
+        """从认证最终响应解析频道表。
 
         Each entry: id, user_channel_id, igmp_addr, timeshift, timeshift_len,
-        timeshift_url, fcc_enable, fcc_ip, fcc_port, fec_port, name, group_title.
+        timeshift_url, fcc_enable, fcc_ip, fcc_port, fec_port, name.
         """
-        CHANNEL_PATTERN = re.compile(
-            r'ChannelID\=\"(\d+)\",'
-            r'ChannelName\=\"(.+?)\",'
-            r'UserChannelID\=\"(\d+)\",'
-            r'ChannelURL=\"igmp://(.+?)\".+?'
-            r'TimeShift\=\"(\d+)\",'
-            r'TimeShiftLength\=\"(\d+)\".+?,'
-            r'TimeShiftURL\=\"(.+?)\?.+?'
-            r'FCCEnable\=\"(\d+)\",'
-            r'ChannelFCCIP\=\"(.*?)\",'
-            r'ChannelFCCPort\=\"(.*?)\",'
-            r'ChannelFECPort\=\"(.*?)\"'
-        )
+        if self._is_session_timeout(resp):
+            self.logger.warning('[get_channel_list] 认证返回会话超时页 (url=%s)', resp.url)
+            return []
 
-        if self._channel_list:
-            return self._channel_list
+        channels = []
+        try:
+            for match in TELECOM_CHANNEL_PATTERN.finditer(resp.text):
+                g = match.groups()
+                channels.append(_make_channel(
+                    g[0], g[1], g[3], CATCHUP_STYLE_QUERY,
+                    user_channel_id=g[2], timeshift=g[4], timeshift_len=g[5],
+                    timeshift_url=g[6], fcc_enable=g[7], fcc_ip=g[8],
+                    fcc_port=g[9], fec_port=g[10],
+                ))
+        except Exception as e:
+            self.logger.error('[get_channel_list] 频道解析失败: %s', e)
 
-        last_resp = None
-        for attempt in range(1, AUTH_RETRY_TIMES + 1):
-            if attempt > 1:
-                delay = AUTH_RETRY_BACKOFF ** (attempt - 1)
-                self.logger.warning(
-                    '[get_channel_list] 第 %s/%s 次尝试：重建会话并重新认证，%ss 后重试',
-                    attempt, AUTH_RETRY_TIMES, delay)
-                time.sleep(delay)
-                self._reset_session()
-
-            last_resp = None
-            try:
-                last_resp = self._authenticate()
-            except IPTVError as e:
-                self.logger.warning('[get_channel_list] 认证过程出错 (%s)', e)
-                if attempt >= AUTH_RETRY_TIMES:
-                    raise
-                continue
-
-            if self._is_session_timeout(last_resp):
-                self.logger.warning(
-                    '[get_channel_list] 认证返回会话超时页 (url=%s)，本次失败',
-                    last_resp.url)
-                continue
-
-            try:
-                for match in CHANNEL_PATTERN.finditer(last_resp.text):
-                    g = match.groups()
-                    self._channel_list.append({
-                        'id': g[0], 'name': g[1], 'user_channel_id': g[2], 'igmp_addr': g[3],
-                        'timeshift': g[4], 'timeshift_len': g[5], 'timeshift_url': g[6],
-                        'fcc_enable': g[7], 'fcc_ip': g[8], 'fcc_port': g[9], 'fec_port': g[10]
-                    })
-            except Exception as e:
-                self.logger.error('[get_channel_list] 频道解析失败: %s', e)
-
-            if self._channel_list:
-                break
+        if not channels:
             self.logger.warning(
-                '[get_channel_list] 未解析到频道 (url=%s, status=%s, len=%s)，准备重试',
-                last_resp.url, last_resp.status_code, len(last_resp.text))
-
-        if not self._channel_list:
-            self.logger.error(
-                '[get_channel_list] 未获取到频道列表，保留已有输出 (url=%s, status=%s, len=%s, content-type=%s)',
-                last_resp.url, last_resp.status_code, len(last_resp.text),
-                last_resp.headers.get('Content-Type', ''))
-            self.logger.error('[get_channel_list] 原始响应前 1000 字符: %r', last_resp.text[:1000])
-            raise IPTVError('未获取到频道列表', label='get_channel_list')
-        self.logger.info('频道列表获取完成: %s 个频道', len(self._channel_list))
-        return self._channel_list
+                '[get_channel_list] 未解析到频道 (url=%s, status=%s, len=%s, content-type=%s)',
+                resp.url, resp.status_code, len(resp.text),
+                resp.headers.get('Content-Type', ''))
+            self.logger.warning('[get_channel_list] 原始响应前 1000 字符: %r', resp.text[:1000])
+        return channels
 
     def get_channel_programs(self, channel_id):
         """Fetch and return the EPG program list for a single channel.
 
         Returns list[dict] with: start, stop, title, channel_id.
         """
-        if self._channel_list is None:
-            self.get_channel_list()
-
         resp = None
         for attempt in range(1, EPG_REAUTH_RETRIES + 1):
             url = urljoin(self._last_url, f'{self.egp_uri}?channelId={channel_id}')
@@ -433,26 +500,26 @@ class IPTVSetTopBox:
                     if not start or not stop:
                         continue
                     title = prog.get('programName', '未知节目')
-                    # < > 转全角避免下游解析问题；& 由 ElementTree 序列化时自行转义，勿手工替换（会二次转义）
-                    title = title.replace('<', '《').replace('>', '》')
-                    programs.append({
-                        'start': start, 'stop': stop,
-                        'title': title, 'channel_id': channel_id,
-                    })
+                    programs.append(self._make_program(
+                        channel_id, start, stop, self._sanitize_title(title)))
         except Exception as e:
             self.logger.error('[get_channel_programs] EPG数据遍历异常 (ch=%s): %s', channel_id, e)
         return programs
 
 
-class CMCCSetTopBox:
+class CMCCSetTopBox(SetTopBox):
     """移动 ysten/taipan EPG 数据源（免认证）。
 
     chlist/pglist 为前置 Nginx 缓存接口，不校验会话，认证链（iptvepg / ysten）
-    与频道、节目单获取无关，因此无需模拟机顶盒认证。
+    与频道、节目单获取无关，因此无需模拟机顶盒认证（_authenticate 沿用基类
+    空实现，将来移动侧需要认证时覆写即可）。
     返回的频道结构与 IPTVSetTopBox 保持一致，供 M3U/EPG 输出管线直接复用。
     """
 
+    list_error_label = 'cmcc_chlist'
+
     def __init__(self, settings=None):
+        super().__init__()
         settings = settings or {}
         self.epg_base = str(settings.get('epg_base') or '').strip().rstrip('/')
         if not self.epg_base:
@@ -466,16 +533,13 @@ class CMCCSetTopBox:
         self.yauth = str(settings.get('yauth') or '').strip()
         # 回看网关前缀：全自动发现（探测 + EPG 采集），非配置项
         self.lookback_base = ''
-        self.session = requests.Session()
         headers = {'User-Agent': 'gefo8(ysten) vfa5'}
         if self.yauth:
             headers['YAUTH'] = self.yauth
         self.headers = headers
-        self._channel_list = []
         # 回看网关自动发现：pglist backPlayUrl 里采集（前缀 + 频道真实回看id）
         self._discovered_prefix = ''
         self._catchup_ids = {}
-        self.logger = logging.getLogger(f'{__name__}.{self.__class__.__name__}')
         self.logger.info('CMCC STB 初始化: epg_base=%s epg_days=%s lookback=%s',
                          self.epg_base, self.epg_days, self.lookback_base or '自动发现')
 
@@ -600,11 +664,8 @@ class CMCCSetTopBox:
     # public API（与 IPTVSetTopBox 对齐）
     # ------------------------------------------------------------------
 
-    def get_channel_list(self):
-        """GET chlist 并映射为与电信模式相同的频道结构。"""
-        if self._channel_list:
-            return self._channel_list
-
+    def _fetch_channel_list(self, resp):
+        """GET chlist 并映射为与电信模式相同的频道结构（resp 未用：免认证）。"""
         data = self._request_json('/chlist', {
             'templateId': '',
             'abilityString': self.ability_string,
@@ -620,16 +681,15 @@ class CMCCSetTopBox:
 
         content = data.get('content') or {}
         self.lookback_base = self._resolve_lookback_base(content)
+        channels = []
         for item in (content.get('channels') or []):
             channel = self._map_channel(item)
             if channel:
-                self._channel_list.append(channel)
-        if not self._channel_list:
+                channels.append(channel)
+        if not channels:
             self.logger.error('[get_channel_list] chlist 无频道数据 (resultCode=%s)',
                               data.get('resultCode'))
-            raise IPTVError('未获取到频道列表', label='cmcc_chlist')
-        self.logger.info('频道列表获取完成: %s 个频道', len(self._channel_list))
-        return self._channel_list
+        return channels
 
     def _map_channel(self, item):
         resolutions = item.get('resolution') or []
@@ -660,21 +720,15 @@ class CMCCSetTopBox:
                                 item.get('name'), channel_id, url)
             return None
         timeshift = '0' if str(item.get('isShowBack') or '0') == '0' else '1'
-        return {
-            'id': channel_id,
-            'name': str(item.get('name') or channel_id),
-            'user_channel_id': str(item.get('num') or ''),
-            'igmp_addr': igmp_addr,
-            'timeshift': timeshift,
-            'timeshift_len': '7',
-            'timeshift_url': str(resolution.get('timeShiftAlias') or ''),
-            'fcc_enable': '1' if (fcc_ip and fcc_port) else '0',
-            'fcc_ip': fcc_ip,
-            'fcc_port': fcc_port,
-            'fec_port': fec_port,
-            # 回看前缀由 finalize_catchup 在 EPG 采集后统一回填（探测/采集失败则为空，优雅降级）
-            'catchup_prefix': '',
-        }
+        # 回看前缀由 finalize_catchup 在 EPG 采集后统一回填（探测/采集失败则为空，优雅降级）
+        return _make_channel(
+            channel_id, str(item.get('name') or channel_id), igmp_addr, CATCHUP_STYLE_PATH,
+            user_channel_id=str(item.get('num') or ''),
+            timeshift=timeshift, timeshift_len='7',
+            timeshift_url=str(resolution.get('timeShiftAlias') or ''),
+            fcc_enable='1' if (fcc_ip and fcc_port) else '0',
+            fcc_ip=fcc_ip, fcc_port=fcc_port, fec_port=fec_port,
+        )
 
     def get_channel_programs(self, channel_id):
         """GET pglist，返回 start/stop 为北京时间 yyyyMMddHHmmss 的节目列表。"""
@@ -702,12 +756,8 @@ class CMCCSetTopBox:
                     if not start or not stop:
                         continue
                     title = str(prog.get('programName') or '未知节目')
-                    # < > 转全角避免下游解析问题；& 由 ElementTree 序列化时自行转义，勿手工替换（会二次转义）
-                    title = title.replace('<', '《').replace('>', '》')
-                    programs.append({
-                        'start': start, 'stop': stop,
-                        'title': title, 'channel_id': channel_id,
-                    })
+                    programs.append(self._make_program(
+                        channel_id, start, stop, self._sanitize_title(title)))
         except AttributeError as e:
             self.logger.error('[get_channel_programs] EPG数据遍历异常 (ch=%s): %s', channel_id, e)
         return programs
@@ -732,29 +782,117 @@ class CMCCSetTopBox:
                          prefix, filled, len(self._catchup_ids))
 
 
-def classify(name):
-    """Return a group-title string for a channel name."""
+# 内置频道清洗与分组规则（rules 未配置时的默认值，与历史行为一致）
+# filter  名称命中任一关键词即剔除
+# strip   频道名清洗词条："词$" 剥尾部、"^词" 剥头部、无标记视为尾部；字面匹配
+# rename  清洗后精确改名
+# groups  分组规则：match 关键词任一命中即归组（按顺序首个命中生效）；
+#         省略 match 的条目为兜底组
+DEFAULT_CHANNEL_RULES = {
+    'filter': [
+        '画中画', '直播', '组播', '中国体育', '导视', '指南', '推荐', '宣传', '云看',
+        '红原', '乐山', '熊猫', '大爱', 'i成都',
+    ],
+    'strip': ['专区$', '高清$', '超清$', '频道$', '-$', '_$', '－$', '—$', ' $', '^IPTV'],
+    'rename': {'CCTV-少儿': 'CCTV-14'},
+    'groups': [
+        {'title': '4K超高清', 'match': ['4K']},
+        {'title': 'CCTV央视', 'match': ['CCTV', 'CGTN', '音乐现场', 'CETV']},
+        {'title': '四川成都', 'match': ['四川', 'SCTV', '峨眉', '乐山', '康巴', '成都', 'CDTV', '蓉城']},
+        {'title': '各省卫视', 'match': ['卫视']},
+        {'title': '数字频道'},
+    ],
+}
+
+
+def classify(name, groups=None):
+    """按分组规则返回频道的 group-title。
+
+    match 关键词任一命中即归组，按 groups 顺序首个命中生效；
+    全部未命中时使用省略 match 的兜底组，仍无则回退“数字频道”。
+    """
+    if groups is None:
+        groups = DEFAULT_CHANNEL_RULES['groups']
+    fallback = '数字频道'
+    default_group = None
+    for group in groups:
+        words = group.get('match') or []
+        if not words:
+            if default_group is None:
+                default_group = str(group.get('title') or '') or fallback
+            continue
+        if re.search('|'.join(map(re.escape, map(str, words))), name):
+            return str(group.get('title') or '') or fallback
+    return default_group or fallback
+
+
+def _resolve_rules(config):
+    """合并用户 rules 与内置默认：整节覆盖，未提供的节沿用默认值。"""
+    user = config.get('rules') or {}
+    rules = {}
+    for key, default in DEFAULT_CHANNEL_RULES.items():
+        value = user.get(key)
+        rules[key] = default if value is None else value
+    return rules
+
+
+def _compile_name_cleaner(rules):
+    """编译 rules.strip / rules.rename 为名称清洗函数（本机与合并频道共用）。"""
     logger = logging.getLogger(__name__)
 
-    IS_4K = ['4K']
-    CCTV = ['CCTV', 'CGTN', '音乐现场']
-    CETV = ['CETV']
-    SCTV = ['四川', 'SCTV', '峨眉', '乐山', '康巴']
-    CDTV = ['成都', 'CDTV', '蓉城']
-    PROV = ['卫视']
+    suffix_words, prefix_words = [], []
+    for word in (rules.get('strip') or []):
+        word = str(word)
+        if word.startswith('^') and word.endswith('$') and len(word) > 2:
+            logger.warning('[rules] strip 词条同时含 ^ 与 $，已忽略: %r', word)
+            continue
+        if word.startswith('^'):
+            if len(word) > 1:
+                prefix_words.append(re.escape(word[1:]))
+        elif word.endswith('$'):
+            if len(word) > 1:
+                suffix_words.append(re.escape(word[:-1]))
+        elif word:
+            suffix_words.append(re.escape(word))
+    # 同方向词条合并为单个正则，一次性剥净结尾/开头的连续组合（如"高清频道"）
+    suffix_pattern = re.compile('(?:' + '|'.join(suffix_words) + ')+$') if suffix_words else None
+    prefix_pattern = re.compile('^(?:' + '|'.join(prefix_words) + ')+') if prefix_words else None
+    rename_map = rules.get('rename') if isinstance(rules.get('rename'), dict) else {}
 
-    try:
-        if re.search('|'.join(IS_4K), name):
-            return '4K超高清'
-        if re.search('|'.join(CCTV), name) or re.search('|'.join(CETV), name):
-            return 'CCTV央视'
-        if re.search('|'.join(SCTV), name) or re.search('|'.join(CDTV), name):
-            return '四川成都'
-        if re.search('|'.join(PROV), name):
-            return '各省卫视'
-    except re.error as e:
-        logger.error('[classify] 正则异常 (name=%s): %s', name, e)
-    return '数字频道'
+    def clean(name):
+        if suffix_pattern:
+            name = suffix_pattern.sub('', name)
+        if prefix_pattern:
+            name = prefix_pattern.sub('', name)
+        return rename_map.get(name, name)
+
+    return clean
+
+
+def _prepare_channels(channels, rules=None):
+    """本机频道清洗：过滤 -> 名称清洗（剥尾/剥头/改名）-> 分组归类。"""
+    rules = rules or DEFAULT_CHANNEL_RULES
+
+    filter_words = []
+    for word in (rules.get('filter') or []):
+        word = str(word)
+        if word:
+            filter_words.append(re.escape(word))
+    filter_pattern = re.compile('|'.join(filter_words)) if filter_words else None
+    clean = _compile_name_cleaner(rules)
+    groups = rules.get('groups') if isinstance(rules.get('groups'), list) else None
+
+    clean_channels = []
+    for ch in channels:
+        name = ch['name']
+        if filter_pattern and filter_pattern.search(name):
+            continue
+        name = clean(name)
+        item = ch.copy()
+        item['name'] = name
+        item['group_title'] = classify(name, groups)
+        clean_channels.append(item)
+    return clean_channels
 
 
 def _m3u_header(x_tvg_url="", isp_label="电信"):
@@ -788,7 +926,12 @@ def _proxy_base_url(proxy, source_url):
 
 def _m3u_channel_url(ch, options):
     if ch.get('url'):
-        return _merge_channel_url(ch['url'], options)
+        # 外部合并频道：仅 rtp:// 地址在配置了代理时改写，http(s) 保持原样
+        source_url = ch['url']
+        proxy = options.get('proxy', '')
+        if proxy and urlparse(source_url).scheme.lower() == 'rtp':
+            return _proxy_base_url(proxy, source_url)
+        return source_url
 
     source_url = f'rtp://{ch["igmp_addr"]}'
     proxy = options.get('proxy', '')
@@ -811,13 +954,6 @@ def _m3u_channel_url(ch, options):
     return url
 
 
-def _merge_channel_url(source_url, options):
-    proxy = options.get('proxy', '')
-    if not proxy or urlparse(source_url).scheme.lower() != 'rtp':
-        return source_url
-    return _proxy_base_url(proxy, source_url)
-
-
 def _apply_catchup_proxy(source, options):
     catchup_proxy = options.get('catchup-proxy', False)
     if isinstance(catchup_proxy, str):
@@ -837,14 +973,13 @@ def _apply_catchup_proxy(source, options):
 def _catchup_attr(ch, options):
     if ch.get('timeshift') == '0':
         return ''
-    if 'catchup_prefix' in ch and not ch.get('catchup_prefix'):
-        # 移动频道但回看网关不可用（探测失败）：优雅降级，不输出回看属性
-        return ''
-    catchup_prefix = ch.get('catchup_prefix')
-    if catchup_prefix:
+    if ch.get('catchup_style') == CATCHUP_STYLE_PATH:
+        if not ch.get('catchup_prefix'):
+            # 移动频道但回看网关不可用（探测失败）：优雅降级，不输出回看属性
+            return ''
         # 移动: 路径式回看模板 .../lookback/<uuid>/<开始>/<结束>/1.m3u8
         catchup_format = str(options.get('catchup-format', DEFAULT_CMCC_CATCHUP_FORMAT)).strip('/')
-        source = f'{catchup_prefix}/{catchup_format}'
+        source = f'{ch["catchup_prefix"]}/{catchup_format}'
     else:
         # 电信: 查询串式回看 ...?playseek=<开始>-<结束>
         catchup_format = str(options.get('catchup-format', DEFAULT_CATCHUP_FORMAT)).lstrip('?&')
@@ -871,10 +1006,10 @@ def _write_m3u_channels(filepath, channels, options=None):
         print(_m3u_header(options.get("x-tvg-url", ""), options.get("isp-label", "电信")), file=fp)
         for ch in channels:
             group_title = ch.get('group_title') or classify(ch['name'])
-            if 'timeshift' in ch:
-                catchup = _catchup_attr(ch, options)
-            else:
+            if ch.get('catchup_style') == CATCHUP_STYLE_ATTRS:
                 catchup = _external_catchup_attr(ch, options)
+            else:
+                catchup = _catchup_attr(ch, options)
             display_name = ch.get('display_name') or ch['name']
             tvg_id = ch.get('tvg_id') or ch['name']
             tvg_name = ch.get('tvg_name') or ch['name']
@@ -888,27 +1023,6 @@ def _write_m3u_channels(filepath, channels, options=None):
                 f' group-title="{group_title}"{catchup}, {display_name}\n'
             )
             fp.write(f'{_m3u_channel_url(ch, options)}\n')
-
-
-def _prepare_channels(channels):
-    exclude_pattern = re.compile(
-        '|'.join([
-            '画中画', '直播', '组播', '中国体育', '导视', '指南', '推荐', '宣传', '云看',
-            '红原', '乐山', '熊猫', '大爱', 'i成都',
-        ])
-    )
-    clean_pattern = re.compile(r'(?:专区|高清|超清|频道)+$')
-    clean_channels = []
-    for ch in channels:
-        if exclude_pattern.search(ch['name']):
-            continue
-        item = ch.copy()
-        item['name'] = clean_pattern.sub('', item['name'])
-        item['name'] = re.sub(r'[-_－—\s]+$', '', item['name'])
-        if item['name'] == 'CCTV-少儿':
-            item['name'] = 'CCTV-14'
-        clean_channels.append(item)
-    return clean_channels
 
 
 def _channel_key(ch):
@@ -953,8 +1067,10 @@ def _dedupe_epg_root(root):
 def _select_channels(channels, selected_channels):
     if not selected_channels:
         return channels
+    logger = logging.getLogger(__name__)
     result = []
     used_indexes = set()
+    matched_names = set()
     for selected_name in selected_channels:
         selected_name = str(selected_name).strip()
         if not selected_name:
@@ -973,6 +1089,7 @@ def _select_channels(channels, selected_channels):
                     break
         if match_index is None:
             continue
+        matched_names.add(selected_name)
         item = channels[match_index].copy()
         item['display_name'] = selected_name
         if item.get('merged'):
@@ -981,6 +1098,12 @@ def _select_channels(channels, selected_channels):
             item['tvg_name'] = selected_name
         result.append(item)
         used_indexes.add(match_index)
+
+    missed = [str(name).strip() for name in selected_channels
+              if str(name).strip() and str(name).strip() not in matched_names]
+    if missed:
+        logger.warning('[generate_m3u] %s 个精选频道未匹配到数据源，已跳过: %s',
+                       len(missed), '、'.join(missed))
     return result
 
 
@@ -1125,17 +1248,26 @@ def resolve_merge_sources(sources, base_dir):
 
 
 def _read_merge_source(source):
+    """读取合并源内容；远程源失败时短退避重试（源可能间歇 404），全部失败返回空。"""
     logger = logging.getLogger(__name__)
+    if _is_url(source):
+        for attempt in range(1, MERGE_RETRY_TIMES + 1):
+            try:
+                resp = _safe_http('GET', source, log_label='MERGE', timeout=30)
+                return resp.content
+            except IPTVError:
+                if attempt >= MERGE_RETRY_TIMES:
+                    logger.error('[merge] 远程源 %s 次获取失败，跳过: %s',
+                                 MERGE_RETRY_TIMES, source)
+                    return b''
+                logger.warning('[merge] 获取失败 (%s/%s)，%ss 后重试: %s',
+                               attempt, MERGE_RETRY_TIMES, MERGE_RETRY_BACKOFF, source)
+                time.sleep(MERGE_RETRY_BACKOFF)
     try:
-        if _is_url(source):
-            resp = _safe_http('GET', source, log_label='MERGE', timeout=30)
-            return resp.content
         with open(source, 'rb') as fp:
             return fp.read()
     except OSError as e:
         logger.error('[merge] 读取本地文件失败 (%s): %s', source, e)
-    except IPTVError:
-        pass
     return b''
 
 
@@ -1175,6 +1307,7 @@ def _parse_m3u_channels(text):
             'group_title': current_attrs.get('group-title', ''),
             'url': line,
             'props': pending_props,
+            'catchup_style': CATCHUP_STYLE_ATTRS,
         }
         catchup_attrs = {
             key: value for key, value in current_attrs.items()
@@ -1189,8 +1322,12 @@ def _parse_m3u_channels(text):
     return channels
 
 
-def load_merge_m3u_channels(sources):
+def load_merge_m3u_channels(sources, rules=None):
+    """读取合并 M3U 为频道列表；id/名称/分组与本机频道按同一套规则处理。"""
     logger = logging.getLogger(__name__)
+    rules = rules or DEFAULT_CHANNEL_RULES
+    clean = _compile_name_cleaner(rules)
+    groups = rules.get('groups') if isinstance(rules.get('groups'), list) else None
     channels = []
     for source in _as_list(sources):
         data = _read_merge_source(source)
@@ -1200,6 +1337,14 @@ def load_merge_m3u_channels(sources):
         source_channels = _parse_m3u_channels(text)
         for channel in source_channels:
             channel['merged'] = True
+            # 外部源的 tvg-id 常缺失或大量重复（不可信）：统一按本机规则重建——
+            # 名称清洗后作为 name/tvg-id/tvg-name，分组按 rules.groups 归类；
+            # 外部 EPG 需按清洗后的频道名提供节目
+            for key in ('name', 'display_name', 'tvg_name'):
+                if channel.get(key):
+                    channel[key] = clean(channel[key])
+            channel['tvg_id'] = channel['name']
+            channel['group_title'] = classify(channel['name'], groups)
         channels.extend(source_channels)
         logger.info('已读取合并 M3U: %s (%s 个频道)', source, len(source_channels))
     return channels
@@ -1297,12 +1442,27 @@ def parse_epg_paths(config, base_dir):
 # 主程序入口：在此处集中配置 logger，然后注入到各个组件
 # ---------------------------------------------------------------------------
 
-if __name__ == '__main__':
+def build_stb(config):
+    """按 isp 构造对应的机顶盒实例，返回 (isp, isp_label, stb)。"""
+    isp = str(config.get('isp') or 'telecom').lower()
+    if isp == 'cmcc':
+        return isp, '移动', CMCCSetTopBox(config.get('cmcc') or {})
+    return isp, '电信', IPTVSetTopBox(
+        user_id=str(config['userid']),
+        key=str(config['key']),
+        stb_id=str(config['stbid']),
+        mac=str(config['mac']),
+        login_entry=str(config.get('login_entry', '')),
+        egp_uri=str(config.get('egp_uri', '')),
+    )
+
+
+def main(argv=None):
     file_path = os.path.dirname(os.path.abspath(__file__)) or '.'
 
     parser = argparse.ArgumentParser(description='电信/移动 IPTV M3U/EPG 生成器')
     parser.add_argument('-f', '--config', default=os.path.join(file_path, 'iptv.json'), help='配置文件路径')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # logger 是此处唯一配置点，不再有模块级全局 logger
     logger = logging.getLogger(__name__)
@@ -1322,45 +1482,35 @@ if __name__ == '__main__':
         merge_config = config.get('merge', {})
         merge_m3u_sources = resolve_merge_sources(merge_config.get('m3u'), config_dir)
         merge_epg_sources = resolve_merge_sources(merge_config.get('epg'), config_dir)
-        selected_config = config.get('selected', {})
-        selected_channels = _as_list(selected_config.get('channels'))
+        selected_channels = _as_list(config.get('selected', {}).get('channels'))
 
-        isp = str(config.get('isp') or 'telecom').lower()
-        isp_label = '移动' if isp == 'cmcc' else '电信'
-        if isp == 'cmcc':
-            stb = CMCCSetTopBox(config.get('cmcc') or {})
-        else:
-            stb = IPTVSetTopBox(
-                user_id=str(config['userid']),
-                key=str(config['key']),
-                stb_id=str(config['stbid']),
-                mac=str(config['mac']),
-                login_entry=str(config.get('login_entry', '')),
-                egp_uri=str(config.get('egp_uri', '')),
-            )
+        isp, isp_label, stb = build_stb(config)
 
-        channels = _prepare_channels(stb.get_channel_list())
+        rules = _resolve_rules(config)
+        channels = _prepare_channels(stb.get_channel_list(), rules)
         m3u_targets = parse_m3u_targets(config, config_dir, config.get("x-tvg-url", ""))
-        merge_m3u_channels = load_merge_m3u_channels(merge_m3u_sources)
+        merge_m3u_channels = load_merge_m3u_channels(merge_m3u_sources, rules)
 
         # 先拉 EPG（移动模式顺带采集回看前缀/频道 id），m3u 生成依赖采集结果，故在其后
         for epg_path in parse_epg_paths(config, config_dir):
             generate_epg(stb, channels, epg_path, source_info_name=f'{isp_label}IPTV')
             merge_epg(epg_path, merge_epg_sources)
-        finalize = getattr(stb, 'finalize_catchup', None)
-        if finalize:
-            finalize(channels)
+        stb.finalize_catchup(channels)
 
         for target in m3u_targets:
             target['options'].setdefault('isp-label', isp_label)
-            target['options'].setdefault('isp', isp)
             target_merge_channels = merge_m3u_channels if target['options'].get('merge') else []
             generate_m3u(channels, target['path'], target['options'], selected_channels, target_merge_channels)
     except IPTVError as e:
         logger.error('IPTV 错误 [%s]: %s', e.label, e)
-        sys.exit(1)
+        return 1
     except SystemExit:
         raise
     except Exception as e:
         logger.exception('程序异常退出: %s', e)
-        sys.exit(1)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
