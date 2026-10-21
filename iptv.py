@@ -782,10 +782,9 @@ class CMCCSetTopBox(SetTopBox):
                          prefix, filled, len(self._catchup_ids))
 
 
-# 内置频道清洗与分组规则（rules 未配置时的默认值，与历史行为一致）
+# 内置频道清洗与分组规则（rules 未提供的节的默认值；rename 无内置默认，按需配置）
 # filter  名称命中任一关键词即剔除
 # strip   频道名清洗词条："词$" 剥尾部、"^词" 剥头部、无标记视为尾部；字面匹配
-# rename  清洗后精确改名
 # groups  分组规则：match 关键词任一命中即归组（按顺序首个命中生效）；
 #         省略 match 的条目为兜底组
 DEFAULT_CHANNEL_RULES = {
@@ -794,7 +793,6 @@ DEFAULT_CHANNEL_RULES = {
         '红原', '乐山', '熊猫', '大爱', 'i成都',
     ],
     'strip': ['专区$', '高清$', '超清$', '频道$', '-$', '_$', '－$', '—$', ' $', '^IPTV'],
-    'rename': {'CCTV-少儿': 'CCTV-14'},
     'groups': [
         {'title': '4K超高清', 'match': ['4K']},
         {'title': 'CCTV央视', 'match': ['CCTV', 'CGTN', '音乐现场', 'CETV']},
@@ -827,12 +825,11 @@ def classify(name, groups=None):
 
 
 def _resolve_rules(config):
-    """合并用户 rules 与内置默认：整节覆盖，未提供的节沿用默认值。"""
-    user = config.get('rules') or {}
-    rules = {}
-    for key, default in DEFAULT_CHANNEL_RULES.items():
-        value = user.get(key)
-        rules[key] = default if value is None else value
+    """合并用户 rules 与内置默认：整节覆盖，用户提供的键始终生效。"""
+    rules = dict(DEFAULT_CHANNEL_RULES)
+    for key, value in (config.get('rules') or {}).items():
+        if value is not None:
+            rules[key] = value
     return rules
 
 

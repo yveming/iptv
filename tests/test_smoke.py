@@ -100,6 +100,8 @@ http://198.51.100.9/mergesat/index.m3u8
 rtp://198.51.100.10:6000
 #EXTINF:-1 tvg-id="IPTV剧集" tvg-name="IPTV剧集" group-title="数字频道", IPTV剧集
 rtp://198.51.100.11:6000
+#EXTINF:-1 tvg-id="求索记录" tvg-name="求索记录" group-title="数字频道" catchup="default" catchup-days="5" catchup-source="rtsp://198.51.100.12/qiusuo?playseek={utc:YmdHMS}-{utcend:YmdHMS}", 求索记录
+rtp://198.51.100.12:6000
 """
 
 MERGE_EPG_XML = """<?xml version="1.0" encoding="utf-8"?>
@@ -131,6 +133,7 @@ TELECOM_CONFIG = {
     "egp_uri": "/EPG/jsp/liveplay_30/en/getTvodData.jsp",
     "x-tvg-url": "http://192.0.2.9:8000/epg/telecom-epg.xml",
     "log": "run.log",
+    "rules": {"rename": {"CCTV-少儿": "CCTV-14"}},
     "m3u": [
         {"telecom-full.m3u": {"selected": False}},
         {"telecom-sel.m3u": {
@@ -147,13 +150,14 @@ TELECOM_CONFIG = {
     ],
     "epg": ["telecom-epg.xml"],
     "merge": {"m3u": ["merge-extra.m3u"], "epg": ["merge-epg.xml"]},
-    "selected": {"channels": ["CCTV-1", "CCTV-4K", "CCTV-16 4K", "MergeSat", "MergeRtp"]},
+    "selected": {"channels": ["CCTV-1", "CCTV-14", "CCTV-4K", "CCTV-16 4K", "MergeSat", "MergeRtp"]},
 }
 
 CMCC_CONFIG = {
     "isp": "cmcc",
     "x-tvg-url": "http://192.0.2.9:8000/epg/cmcc-epg.xml",
     "log": "run.log",
+    "rules": {"rename": {"求索记录": "求索纪录"}},
     "cmcc": {
         "epg_base": "http://mock-cmcc:7070/ysten-wtv-epg/epg/wtv",
         "ability_string": {"userGroupIds": ["xxxx"]},
@@ -168,7 +172,7 @@ CMCC_CONFIG = {
     ],
     "epg": ["cmcc-epg.xml"],
     "merge": {"m3u": ["merge-extra.m3u"], "epg": ["merge-epg.xml.gz"]},
-    "selected": {"channels": ["CCTV-1", "CCTV-5", "MergeSat", "剧集"]},
+    "selected": {"channels": ["CCTV-1", "CCTV-5", "MergeSat", "剧集", "求索纪录"]},
 }
 
 COMPARABLE = [
