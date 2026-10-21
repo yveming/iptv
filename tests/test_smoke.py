@@ -3,8 +3,8 @@
 """离线冒烟测试：mock 全部 HTTP，跑通电信/移动两个 ISP 的完整输出管线。
 
 用途:
-    python test_smoke.py --update-golden   # 生成/更新 tests/golden 基线
-    python test_smoke.py                   # 对比当前代码输出与基线
+    python tests/test_smoke.py --update-golden   # 生成/更新 tests/golden 基线
+    python tests/test_smoke.py                   # 对比当前代码输出与基线
 
 数据源:
     电信频道表  docs/channellistHWCTC.jsp        (真实抓包)
@@ -25,12 +25,12 @@ import shutil
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, ROOT)
 import iptv  # noqa: E402
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-GOLDEN_DIR = os.path.join(ROOT, 'tests', 'golden')
-RUN_BASE = r'C:\Users\ming\AppData\Local\Temp\opencode\smoke-run'
+GOLDEN_DIR = os.path.join(SCRIPT_DIR, 'golden')
 
 TIMESTAMP_RE = re.compile(r'@\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')
 
@@ -156,7 +156,7 @@ CMCC_CONFIG = {
     "log": "run.log",
     "cmcc": {
         "epg_base": "http://mock-cmcc:7070/ysten-wtv-epg/epg/wtv",
-        "ability_string": {"userGroupIds": ["<group-id>"]},
+        "ability_string": {"userGroupIds": ["xxxx"]},
     },
     "m3u": [
         {"cmcc-full.m3u": {"selected": False}},
