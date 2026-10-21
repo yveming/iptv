@@ -337,10 +337,6 @@ EPG 合并后会按频道 `id` 和节目 `(channel, start, stop, title)` 去重�
 ## 辅助脚本
 
 - [findkey.py](findkey.py)：用于尝试从 Authenticator 中查找 DES key。
-- [tests/test_smoke.py](tests/test_smoke.py)：离线冒烟测试——mock 全部网络，
-  用 `docs/` 抓包数据跑通电信/移动双 ISP 管线并与 `tests/golden/` 基线逐字节对比，
-  改动代码后运行 `python tests/test_smoke.py` 即可回归；有意变更行为时用
-  `--update-golden` 刷新基线。
 
 ## 授权协议
 
