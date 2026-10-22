@@ -9,7 +9,7 @@
 - 支持一次运行输出多个 M3U 文件
 - 支持按频道名关键词生成精选 M3U
 - 精选频道支持模糊匹配，并按选定顺序输出
-- 精选频道写入 M3U 时可替换显示名，且不改变 `tvg-id` / `tvg-name`
+- 精选频道写入 M3U 时可替换显示名（本机频道不改 `tvg-id` / `tvg-name`，合并频道统一采用精选名）
 - 支持通过 `rules` 配置自定义频道过滤、名称前后缀清洗、改名与分组归类
 - 支持代理播放地址和 FCC 参数配置
 - 支持合并外部 M3U / EPG 到最终输出文件
@@ -39,7 +39,7 @@ python iptv.py
 
 ## 移动 IPTV
 
-配置文件设置 `"isp": "cmcc"` 即启用移动模式。频道与节目单来自移动侧 ysten EPG 接口（`chlist` / `pglist`），无需认证，电信模式的必填字段（`userid`、`key`、`stbid`、`login_entry`、`egp_uri`）全部不再需要，移动模式仅要求 `epg_base` 和 `ability_string`：
+配置文件设置 `"isp": "cmcc"` 即启用移动模式。频道与节目单来自移动侧 ysten EPG 接口（`chlist` / `pglist`），无需认证，电信模式的必填字段（`userid`、`key`、`stbid`、`mac`、`login_entry`、`egp_uri`）全部不再需要，移动模式仅要求 `epg_base` 和 `ability_string`：
 
 ```json
 {
@@ -252,7 +252,8 @@ python iptv.py
 }
 ```
 
-处理顺序：过滤 -> 尾部/头部剥离 -> 精确改名 -> 分组归类（仅作用于本机频道）。
+处理顺序：过滤 -> 尾部/头部剥离 -> 精确改名 -> 分组归类（`filter` 仅作用于本机频道；
+`strip` / `rename` / `groups` 同时作用于合并频道）。
 
 - `filter`：频道名包含任一关键词（字面匹配）即剔除
 - `strip`：`词$` 或无标记剥尾部，`^词` 剥头部；词条按字面匹配，无需转义正则；
@@ -261,9 +262,6 @@ python iptv.py
 - `rename`：清洗后的名称精确匹配时改名
 - `groups`：`match` 关键词任一命中即归入该组，按列表顺序首个命中生效；
   省略 `match` 的条目为兜底组；全部未命中且无兜底条目时回退“数字频道”
-
-分组归属：本机频道按清洗后的名称归类；外部合并频道沿用其自带的 `group-title`，
-缺失时按内置规则归类。
 
 `strip` / `rename` 与 `groups` 同样作用于外部合并频道：名称清洗后，`tvg-id` /
 `tvg-name` 统一重建为清洗后的频道名（外部源 id 常缺失或重复，不可信），分组按
@@ -332,7 +330,7 @@ http://192.168.1.50:4022/rtp/239.94.0.31:5140?r2h-token=12345678&fcc=192.0.2.2:8
 外部 M3U 会先解析成频道，按本机 `rules` 统一处理：`strip` / `rename` 清洗名称，
 `tvg-id` / `tvg-name` 重建为清洗后的频道名（外部源 id 不可信），分组按 `groups`
 归类；外来代理形式的播放地址（`http(s)://<代理>/<udp|rtp|rtsp|http>/<原始地址>`）
-会还原为 `rtp://` / `rtsp://` / `http://` 原始流地址，再与本机频道一起参与精选匹配、排序和去重；如果目标 M3U 配置了 `proxy`，外部 M3U 中的 `rtp://` 播放地址也会转换为代理地址，`http://` / `https://` 地址保持原样。频道自带的 `catchup` / `catchup-days` / `catchup-source` 等回看属性会被保留；目标 M3U 开启 `catchup-proxy` 时，外部频道的回看地址也按同样规则套用代理。合并频道命中精选时，`tvg-id` / `tvg-name` / 显示名会统一替换为精选名，因此外部 EPG 需使用对应的频道名才能匹配。
+会还原为 `rtp://` / `rtsp://` / `http://` 原始流地址，再与本机频道一起参与精选匹配、排序和去重；如果目标 M3U 配置了 `proxy`，外部 M3U 中的 `rtp://` 播放地址也会转换为代理地址，还原出的 `rtsp://` / `http://` 地址不参与代理转换，保持原样。频道自带的 `catchup` / `catchup-days` / `catchup-source` 等回看属性会被保留；目标 M3U 开启 `catchup-proxy` 时，外部频道的回看地址也按同样规则套用代理。合并频道命中精选时，`tvg-id` / `tvg-name` / 显示名会统一替换为精选名，因此外部 EPG 需使用对应的频道名才能匹配。
 
 EPG 合并后会按频道 `id` 和节目 `(channel, start, stop, title)` 去重，重新写入目标 XML，并重新生成 `.gz` 文件。
 
