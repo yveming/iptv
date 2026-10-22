@@ -331,7 +331,8 @@ http://192.168.1.50:4022/rtp/239.94.0.31:5140?r2h-token=12345678&fcc=192.0.2.2:8
 
 外部 M3U 会先解析成频道，按本机 `rules` 统一处理：`strip` / `rename` 清洗名称，
 `tvg-id` / `tvg-name` 重建为清洗后的频道名（外部源 id 不可信），分组按 `groups`
-归类，之后与本机频道一起参与精选匹配、排序和去重；如果目标 M3U 配置了 `proxy`，外部 M3U 中的 `rtp://` 播放地址也会转换为代理地址，`http://` / `https://` 地址保持原样。频道自带的 `catchup` / `catchup-days` / `catchup-source` 等回看属性会被保留；目标 M3U 开启 `catchup-proxy` 时，外部频道的回看地址也按同样规则套用代理。合并频道命中精选时，`tvg-id` / `tvg-name` / 显示名会统一替换为精选名，因此外部 EPG 需使用对应的频道名才能匹配。
+归类；外来代理形式的播放地址（`http(s)://<代理>/<udp|rtp|rtsp|http>/<原始地址>`）
+会还原为 `rtp://` / `rtsp://` / `http://` 原始流地址，再与本机频道一起参与精选匹配、排序和去重；如果目标 M3U 配置了 `proxy`，外部 M3U 中的 `rtp://` 播放地址也会转换为代理地址，`http://` / `https://` 地址保持原样。频道自带的 `catchup` / `catchup-days` / `catchup-source` 等回看属性会被保留；目标 M3U 开启 `catchup-proxy` 时，外部频道的回看地址也按同样规则套用代理。合并频道命中精选时，`tvg-id` / `tvg-name` / 显示名会统一替换为精选名，因此外部 EPG 需使用对应的频道名才能匹配。
 
 EPG 合并后会按频道 `id` 和节目 `(channel, start, stop, title)` 去重，重新写入目标 XML，并重新生成 `.gz` 文件。
 

@@ -1272,6 +1272,30 @@ def _parse_extinf_attrs(extinf):
     return dict(re.findall(r'([\w-]+)="([^"]*)"', extinf))
 
 
+# 外来 udpxy/r2h 形式代理地址：scheme(http/https) + 中段(udp/rtp/rtsp/http) + 原始地址
+PROXY_URL_PATTERN = re.compile(r'^https?://[^/]+/(udp|rtp|rtsp|http)/(.+)$', re.IGNORECASE)
+UNWRAP_SCHEME = {'udp': 'rtp', 'rtp': 'rtp', 'rtsp': 'rtsp', 'http': 'http'}
+
+
+def _unwrap_proxy_url(url):
+    """外来代理地址还原为原始流地址，非代理形式原样返回。
+
+    udp/rtp 中段仅保留组播 ip:port（代理自身的路径与参数无意义，丢弃）；
+    rtsp/http 中段保留其后的路径与查询。
+    """
+    m = PROXY_URL_PATTERN.match(str(url).strip())
+    if not m:
+        return url
+    scheme = UNWRAP_SCHEME[m.group(1).lower()]
+    rest = m.group(2)
+    if scheme == 'rtp':
+        m2 = re.match(r'(\d{1,3}(?:\.\d{1,3}){3}:\d+)', rest)
+        if not m2:
+            return url
+        return f'rtp://{m2.group(1)}'
+    return f'{scheme}://{rest}'
+
+
 def _parse_m3u_channels(text):
     channels = []
     pending_props = []
@@ -1302,7 +1326,7 @@ def _parse_m3u_channels(text):
             'tvg_id': tvg_id or name,
             'tvg_name': tvg_name or name,
             'group_title': current_attrs.get('group-title', ''),
-            'url': line,
+            'url': _unwrap_proxy_url(line),
             'props': pending_props,
             'catchup_style': CATCHUP_STYLE_ATTRS,
         }

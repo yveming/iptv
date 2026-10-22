@@ -102,6 +102,10 @@ rtp://198.51.100.10:6000
 rtp://198.51.100.11:6000
 #EXTINF:-1 tvg-id="求索记录" tvg-name="求索记录" group-title="数字频道" catchup="default" catchup-days="5" catchup-source="rtsp://198.51.100.12/qiusuo?playseek={utc:YmdHMS}-{utcend:YmdHMS}", 求索记录
 rtp://198.51.100.12:6000
+#EXTINF:-1 tvg-id="MergeUdpxy" tvg-name="MergeUdpxy" group-title="数字频道", MergeUdpxy
+http://198.51.100.13/udp/239.10.0.200:5140
+#EXTINF:-1 tvg-id="MergeHttps" tvg-name="MergeHttps" group-title="数字频道", MergeHttps
+https://198.51.100.14/rtp/239.10.0.201:5140
 """
 
 MERGE_EPG_XML = """<?xml version="1.0" encoding="utf-8"?>
@@ -172,7 +176,7 @@ CMCC_CONFIG = {
     ],
     "epg": ["cmcc-epg.xml"],
     "merge": {"m3u": ["merge-extra.m3u"], "epg": ["merge-epg.xml.gz"]},
-    "selected": {"channels": ["CCTV-1", "CCTV-5", "MergeSat", "剧集", "求索纪录"]},
+    "selected": {"channels": ["CCTV-1", "CCTV-5", "MergeSat", "剧集", "求索纪录", "MergeUdpxy"]},
 }
 
 COMPARABLE = [
